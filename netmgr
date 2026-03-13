@@ -1,0 +1,211 @@
+#!/bin/bash
+
+# netmgr - Network management tool
+# Mimics diskpart style interactive shell and subcommands
+
+# Helper to convert IP range (8.8.8.0 - 8.8.8.255) to CIDR (8.8.8.0/24)
+range_to_cidr() {
+    local range="$1"
+    if [[ "$range" != *" - "* ]]; then
+        echo "$range"
+        return
+    fi
+
+    local start_ip=$(echo "$range" | awk -F' - ' '{print $1}' | xargs)
+    local end_ip=$(echo "$range" | awk -F' - ' '{print $2}' | xargs)
+
+    IFS='.' read -r a b c d <<< "$start_ip"
+    local start_int=$(( (a << 24) + (b << 16) + (c << 8) + d ))
+    IFS='.' read -r a b c d <<< "$end_ip"
+    local end_int=$(( (a << 24) + (b << 16) + (c << 8) + d ))
+
+    local diff=$(( end_int - start_int ))
+    local bits=0
+    while [ $(( 2**bits - 1 )) -lt $diff ]; do
+        ((bits++))
+    done
+    
+    echo "$start_ip/$(( 32 - bits ))"
+}
+
+# Helper to find correct local CIDR for an IP (using routing table)
+get_local_cidr() {
+    local ip="$1"
+    local cidr=$(ip addr show | grep -w "inet" | awk '{print $2}' | grep -v "127.0.0.1" | while read -r line; do
+        if [[ $ip == ${line%.*}.* ]]; then
+            echo "$line"
+            return
+        fi
+    done | head -n 1)
+
+    if [ -n "$cidr" ]; then
+        local suffix="${cidr#*/}"
+        echo "${ip%.*}.0/$suffix"
+    else
+        if [[ $ip =~ ^192\.168\. ]]; then echo "${ip%.*}.0/24";
+        elif [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then echo "172.16.0.0/12";
+        elif [[ $ip =~ ^10\. ]]; then echo "10.0.0.0/8";
+        else echo "Private"; fi
+    fi
+}
+
+scan_subnet() {
+    INTF=$(ip route | grep default | awk '{print $5}')
+    MY_IP=$(ip addr show "$INTF" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
+    MY_MAC=$(cat "/sys/class/net/$INTF/address" 2>/dev/null)
+    SUBNET=$(ip addr show "$INTF" | awk '/inet / {print $2}' | head -n 1)
+    TARGET=${1:-$SUBNET}
+
+    if [ -z "$TARGET" ]; then
+        echo "Error: Could not detect local subnet. Please provide one (e.g., scan 192.168.50.0/24)"
+        return 1
+    fi
+
+    echo ""
+    echo "Scanning Subnet: $TARGET..."
+    echo "-----------------------------------------------------------------------------------------------------------------------------------"
+    printf "%-15s %-25s %-18s %-30s %s\n" "IP Address" "Hostname/Identity" "MAC Address" "Manufacturer" "Ports"
+    echo "-----------------------------------------------------------------------------------------------------------------------------------"
+
+    tmp_arp=$(mktemp)
+    tmp_nbt=$(mktemp)
+    tmp_nmap=$(mktemp)
+
+    sudo arp-scan -g --retry=1 --timeout=200 "$TARGET" > "$tmp_arp" 2>/dev/null &
+    nbtscan "$TARGET" > "$tmp_nbt" 2>/dev/null &
+    sudo nmap -sS -T4 -F -R --system-dns --min-parallelism 100 --max-retries 1 --max-rtt-timeout 200ms "$TARGET" -oG - > "$tmp_nmap" 2>/dev/null &
+
+    wait
+
+    awk -v arp_file="$tmp_arp" -v nbt_file="$tmp_nbt" -v my_ip="$MY_IP" -v my_mac="$MY_MAC" '
+    BEGIN {
+        while ((getline < nbt_file) > 0) {
+            if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                name = $2; gsub(/[ \t.]+$/, "", name);
+                if (name != "" && name != "unknown") names[$1] = name
+            }
+        }
+        while ((getline < arp_file) > 0) {
+            if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                macs[$1] = $2
+                start_v = index($0, $3); if (start_v > 0) vendors[$1] = substr($0, start_v)
+            }
+        }
+        macs[my_ip] = my_mac
+        vendors[my_ip] = "(This Computer)"
+    }
+    /Host:/ {
+        ip = $2
+        dns_h = $3; gsub(/[()]/, "", dns_h);
+        if (names[ip] == "") {
+            if (dns_h != "" && dns_h != "unknown") names[ip] = dns_h;
+        }
+        if (match($0, /Ports: /)) {
+            split(substr($0, RSTART+7), p_part, "\t");
+            p_data = p_part[1]; sub(/Ignored.*/, "", p_data);
+            n_p = split(p_data, p_arr, ", ");
+            p_list = "";
+            for (i=1; i<=n_p; i++) {
+                split(p_arr[i], p_info, "/");
+                if (p_info[1] != "" && p_info[2] ~ /open/) {
+                    p_list = p_list p_info[1] "(" p_info[5] ") ";
+                }
+            }
+            if (p_list != "") ports[ip] = p_list;
+        }
+        active[ip] = 1;
+    }
+    END {
+        for (ip in active) {
+            disp_h = (names[ip] != "") ? names[ip] : "unknown"
+            if (length(disp_h) > 22) disp_h = substr(disp_h, 1, 19) "..."
+            mac = (macs[ip] != "") ? macs[ip] : "external"
+            vendor = (vendors[ip] != "") ? vendors[ip] : "routed/hidden"
+            p_list = (ports[ip] != "") ? ports[ip] : "none"
+            printf "%-15s %-25s %-18s %-30s %s\n", ip, disp_h, mac, vendor, p_list | "sort -V"
+        }
+    }
+    ' "$tmp_nmap"
+    rm "$tmp_arp" "$tmp_nbt" "$tmp_nmap"
+    echo "-----------------------------------------------------------------------------------------------------------------------------------"
+    echo ""
+}
+
+show_ports() {
+    sudo ss -tulpn | column -t
+}
+
+run_traceroute() {
+    echo ""
+    echo "Tracing path to 8.8.8.8..."
+    echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
+    printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "Hop" "IP Address" "Latency" "CIDR" "Netname" "ASN" "Location"
+    echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
+
+    # mtr -r -c 3 -n 8.8.8.8 gives better average latency
+    mtr -r -c 3 -n 8.8.8.8 | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
+        if [[ $ip =~ ^[0-9] ]] && [[ $ip != "???" ]]; then
+            ((hop++))
+            w_data=$(whois "$ip" 2>/dev/null)
+            
+            raw_cidr=$(echo "$w_data" | grep -iE "route:|CIDR:|NetRange:" | head -n 1 | awk -F: '{print $2}' | xargs)
+            cidr=$(range_to_cidr "$raw_cidr")
+            
+            netname=$(echo "$w_data" | grep -iE "netname:|owner:" | head -n 1 | awk -F: '{print $2}' | xargs)
+            asn=$(echo "$w_data" | grep -iE "origin:|originAS:|aut-num:" | head -n 1 | awk -F: '{print $2}' | xargs)
+            country=$(echo "$w_data" | grep -i "country:" | head -n 1 | awk -F: '{print $2}' | xargs)
+            city=$(echo "$w_data" | grep -i "city:" | head -n 1 | awk -F: '{print $2}' | xargs)
+            
+            location="${country:-??}"
+            if [ -n "$city" ]; then location="$location ($city)"; fi
+            
+            if [[ $ip =~ ^192\.168\. ]]; then
+                cidr=$(get_local_cidr "$ip")
+                netname="Local Network"
+                asn="N/A"
+                location="N/A"
+            elif [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+                if [ -z "$cidr" ] || [ "$cidr" == "??" ]; then cidr=$(get_local_cidr "$ip"); fi
+                if [ -z "$netname" ] || [ "$netname" == "??" ]; then netname="Local Network"; fi
+                if [ -z "$asn" ] || [ "$asn" == "??" ]; then asn="N/A"; fi
+                location="N/A"
+            fi
+
+            if [ ${#netname} -gt 23 ]; then netname="${netname:0:20}..."; fi
+
+            printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "$hop" "$ip" "${latency}ms" "${cidr:-??}" "${netname:-??}" "${asn:-??}" "$location"
+        fi
+    done
+    echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
+    echo ""
+}
+
+show_help() {
+    echo "NETMGR Commands:"
+    echo "  scan [subnet]  - Comprehensive scan using ARP, NBT, and Nmap."
+    echo "  ports          - Show active listening ports (TCP/UDP)."
+    echo "  traceroute     - Deep traceroute with Latency, CIDR, ASN, and Location."
+    echo "  exit           - Exit the netmgr tool."
+    echo "  help           - Show this help message."
+}
+
+run_command() {
+    case "$1" in
+        scan) shift; scan_subnet "$@"; ;;
+        ports) show_ports; ;;
+        traceroute) run_traceroute; ;;
+        help) show_help; ;;
+        exit|quit) exit 0; ;;
+        "") ;;
+        *) echo "Unknown command: $1"; ;;
+    esac
+}
+
+if [ $# -gt 0 ]; then
+    run_command "$@"
+else
+    while true; do
+        read -p "NETMGR> " cmd args
+        run_command "$cmd" $args
+    done
+fi
