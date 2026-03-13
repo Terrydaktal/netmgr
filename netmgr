@@ -3,11 +3,12 @@
 # netmgr - Network management tool
 # Mimics diskpart style interactive shell and subcommands
 
-# Helper to convert IP range (8.8.8.0 - 8.8.8.255) to CIDR (8.8.8.0/24)
-range_to_cidr() {
+# Helper to convert IP range (8.8.8.0 - 8.8.8.255) to CIDR suffix (/24)
+range_to_suffix() {
     local range="$1"
     if [[ "$range" != *" - "* ]]; then
-        echo "$range"
+        # If already CIDR like /24, return just suffix
+        if [[ "$range" == *"/"* ]]; then echo "/${range#*/}"; else echo ""; fi
         return
     fi
 
@@ -25,7 +26,7 @@ range_to_cidr() {
         ((bits++))
     done
     
-    echo "$start_ip/$(( 32 - bits ))"
+    echo "/$(( 32 - bits ))"
 }
 
 # Helper to find correct local CIDR for an IP (using routing table)
@@ -39,13 +40,12 @@ get_local_cidr() {
     done | head -n 1)
 
     if [ -n "$cidr" ]; then
-        local suffix="${cidr#*/}"
-        echo "${ip%.*}.0/$suffix"
+        echo "/${cidr#*/}"
     else
-        if [[ $ip =~ ^192\.168\. ]]; then echo "${ip%.*}.0/24";
-        elif [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then echo "172.16.0.0/12";
-        elif [[ $ip =~ ^10\. ]]; then echo "10.0.0.0/8";
-        else echo "Private"; fi
+        if [[ $ip =~ ^192\.168\. ]]; then echo "/24";
+        elif [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then echo "/12";
+        elif [[ $ip =~ ^10\. ]]; then echo "/8";
+        else echo ""; fi
     fi
 }
 
@@ -53,13 +53,16 @@ show_interfaces() {
     echo ""
     echo "Local Network Interfaces:"
     echo "----------------------------------------------------------------------------------------------------------------"
-    printf "%-12s %-8s %-18s %-18s %-10s %s\n" "Interface" "Status" "IP Address" "MAC Address" "MTU" "Flags"
+    printf "%-12s %-8s %-18s %-18s %-10s %s\n" "Interface" "Status" "IP Address" "MAC Address" "MTU" "DHCP"
     echo "----------------------------------------------------------------------------------------------------------------"
 
     ip -j addr show | jq -r '.[] | 
-        "\(.ifname) \(.operstate) \((.addr_info[]? | select(.family == "inet") | .local) // "N/A") \(.address) \(.mtu) \(.flags | join(","))"' | \
-    while read -r name state ip mac mtu flags; do
-        printf "%-12s %-8s %-18s %-18s %-10s %s\n" "$name" "$state" "$ip" "$mac" "$mtu" "$flags"
+        "\(.ifname) \(.operstate) \((.addr_info[]? | select(.family == "inet") | "\(.local)/\(.prefixlen)") // "N/A") \(.address) \(.mtu) \((.addr_info[]? | select(.family == "inet") | .dynamic) // false)"' | \
+    while read -r name state ip mac mtu dynamic; do
+        is_dynamic="No"
+        if [ "$dynamic" == "true" ]; then is_dynamic="Yes"; fi
+        if [ "$ip" == "N/A" ]; then is_dynamic="N/A"; fi
+        printf "%-12s %-8s %-18s %-18s %-10s %s\n" "$name" "$state" "$ip" "$mac" "$mtu" "$is_dynamic"
     done
     echo "----------------------------------------------------------------------------------------------------------------"
     echo ""
@@ -155,9 +158,10 @@ get_hop_info() {
     local ip="$1"
     local latency="$2"
     local hop="$3"
+    local suffix=""
     
     if [[ $ip =~ ^192\.168\. ]] || [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
-        cidr=$(get_local_cidr "$ip")
+        suffix=$(get_local_cidr "$ip")
         netname="Local Network"
         asn="N/A"
         location="N/A"
@@ -165,7 +169,9 @@ get_hop_info() {
         ip_data=$(curl -s "https://ipinfo.io/$ip")
         cymru_data=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -n 1)
         
-        cidr=$(echo "$cymru_data" | awk -F'|' '{print $3}' | xargs)
+        raw_range=$(echo "$cymru_data" | awk -F'|' '{print $3}' | xargs)
+        suffix=$(range_to_suffix "$raw_range")
+        
         city=$(echo "$ip_data" | jq -r '.city // empty')
         country=$(echo "$ip_data" | jq -r '.country // empty')
         postal=$(echo "$ip_data" | jq -r '.postal // empty')
@@ -180,11 +186,10 @@ get_hop_info() {
     fi
 
     if [ -z "$netname" ] || [[ "$netname" == "AS Name" ]]; then netname="unknown"; fi
-    if [ ${#netname} -gt 23 ]; then netname="${netname:0:20}..."; fi
+    if [ ${#netname} -gt 28 ]; then netname="${netname:0:25}..."; fi
     if [[ "$asn" == "AS" ]] || [[ "$asn" == "N/A" ]] || [ -z "$asn" ]; then asn_disp="N/A"; else asn_disp="$asn"; fi
-    if [ -z "$cidr" ] || [[ "$cidr" == "BGP Prefix" ]]; then cidr="??"; fi
 
-    printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "$hop" "$ip" "${latency}ms" "$cidr" "$netname" "$asn_disp" "$location"
+    printf "%-3s %-20s %-10s %-30s %-12s %s\n" "$hop" "$ip$suffix" "${latency}ms" "$netname" "$asn_disp" "$location"
 }
 
 run_traceroute() {
@@ -192,7 +197,7 @@ run_traceroute() {
     echo ""
     echo "Tracing path to $target..."
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
-    printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "Hop" "IP Address" "Latency" "CIDR" "Netname" "ASN" "Location"
+    printf "%-3s %-20s %-10s %-30s %-12s %s\n" "Hop" "IP Address" "Latency" "Netname" "ASN" "Location"
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
 
     mtr -r -c 3 -n "$target" | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
@@ -229,31 +234,14 @@ show_help() {
 
 run_command() {
     case "$1" in
-        interfaces)
-            show_interfaces
-            ;;
-        scan)
-            shift
-            scan_subnet "$@"
-            ;;
-        ports)
-            show_ports
-            ;;
-        traceroute)
-            shift
-            run_traceroute "$@"
-            ;;
-        help)
-            show_help
-            ;;
-        exit|quit)
-            exit 0
-            ;;
-        "")
-            ;;
-        *)
-            echo "Unknown command: $1"
-            ;;
+        interfaces) show_interfaces; ;;
+        scan) shift; scan_subnet "$@"; ;;
+        ports) show_ports; ;;
+        traceroute) shift; run_traceroute "$@"; ;;
+        help) show_help; ;;
+        exit|quit) exit 0; ;;
+        "") ;;
+        *) echo "Unknown command: $1"; ;;
     esac
 }
 
