@@ -135,65 +135,89 @@ show_ports() {
     sudo ss -tulpn | column -t
 }
 
+get_hop_info() {
+    local ip="$1"
+    local latency="$2"
+    local hop="$3"
+    
+    if [[ $ip =~ ^192\.168\. ]] || [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+        cidr=$(get_local_cidr "$ip")
+        netname="Local Network"
+        asn="N/A"
+        location="N/A"
+    else
+        ip_data=$(curl -s "https://ipinfo.io/$ip")
+        cymru_data=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -n 1)
+        
+        cidr=$(echo "$cymru_data" | awk -F'|' '{print $3}' | xargs)
+        city=$(echo "$ip_data" | jq -r '.city // empty')
+        country=$(echo "$ip_data" | jq -r '.country // empty')
+        postal=$(echo "$ip_data" | jq -r '.postal // empty')
+        org=$(echo "$ip_data" | jq -r '.org // empty')
+        
+        asn=$(echo "$org" | grep -oP '^AS\d+' || echo "N/A")
+        netname=$(echo "$org" | sed -E "s/^AS[0-9]+ //" || echo "unknown")
+        
+        location="${country:-??}"
+        if [ -n "$city" ]; then location="$location ($city)"; fi
+        if [ -n "$postal" ]; then location="$location [$postal]"; fi
+    fi
+
+    if [ -z "$netname" ] || [[ "$netname" == "AS Name" ]]; then netname="unknown"; fi
+    if [ ${#netname} -gt 23 ]; then netname="${netname:0:20}..."; fi
+    if [[ "$asn" == "AS" ]] || [[ "$asn" == "N/A" ]] || [ -z "$asn" ]; then asn_disp="N/A"; else asn_disp="$asn"; fi
+    if [ -z "$cidr" ] || [[ "$cidr" == "BGP Prefix" ]]; then cidr="??"; fi
+
+    printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "$hop" "$ip" "${latency}ms" "$cidr" "$netname" "$asn_disp" "$location"
+}
+
 run_traceroute() {
+    local target="${1:-8.8.8.8}"
     echo ""
-    echo "Tracing path to 8.8.8.8..."
+    echo "Tracing path to $target..."
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
     printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "Hop" "IP Address" "Latency" "CIDR" "Netname" "ASN" "Location"
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
 
-    # mtr -r -c 3 -n 8.8.8.8 gives better average latency
-    mtr -r -c 3 -n 8.8.8.8 | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
+    mtr -r -c 3 -n "$target" | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
         if [[ $ip =~ ^[0-9] ]] && [[ $ip != "???" ]]; then
             ((hop++))
-            w_data=$(whois "$ip" 2>/dev/null)
-            
-            raw_cidr=$(echo "$w_data" | grep -iE "route:|CIDR:|NetRange:" | head -n 1 | awk -F: '{print $2}' | xargs)
-            cidr=$(range_to_cidr "$raw_cidr")
-            
-            netname=$(echo "$w_data" | grep -iE "netname:|owner:" | head -n 1 | awk -F: '{print $2}' | xargs)
-            asn=$(echo "$w_data" | grep -iE "origin:|originAS:|aut-num:" | head -n 1 | awk -F: '{print $2}' | xargs)
-            country=$(echo "$w_data" | grep -i "country:" | head -n 1 | awk -F: '{print $2}' | xargs)
-            city=$(echo "$w_data" | grep -i "city:" | head -n 1 | awk -F: '{print $2}' | xargs)
-            
-            location="${country:-??}"
-            if [ -n "$city" ]; then location="$location ($city)"; fi
-            
-            if [[ $ip =~ ^192\.168\. ]]; then
-                cidr=$(get_local_cidr "$ip")
-                netname="Local Network"
-                asn="N/A"
-                location="N/A"
-            elif [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
-                if [ -z "$cidr" ] || [ "$cidr" == "??" ]; then cidr=$(get_local_cidr "$ip"); fi
-                if [ -z "$netname" ] || [ "$netname" == "??" ]; then netname="Local Network"; fi
-                if [ -z "$asn" ] || [ "$asn" == "??" ]; then asn="N/A"; fi
-                location="N/A"
-            fi
-
-            if [ ${#netname} -gt 23 ]; then netname="${netname:0:20}..."; fi
-
-            printf "%-3s %-15s %-10s %-18s %-25s %-10s %s\n" "$hop" "$ip" "${latency}ms" "${cidr:-??}" "${netname:-??}" "${asn:-??}" "$location"
+            get_hop_info "$ip" "$latency" "$hop"
         fi
     done
+
+    # Final Edge Node Identification (Only if target is 8.8.8.8)
+    if [[ "$target" == "8.8.8.8" ]]; then
+        # Extract only the line that looks like an IP address (excluding client-subnet)
+        edge_ip=$(dig +short TXT o-o.myaddr.l.google.com @8.8.8.8 | tr -d '"' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+        if [ -n "$edge_ip" ]; then
+            # Perform a quick ping to get latency to the real node
+            edge_latency=$(ping -c 1 -W 1 "$edge_ip" | grep "time=" | sed -E 's/.*time=([0-9.]+).*/\1/')
+            if [ -z "$edge_latency" ]; then edge_latency="N/A"; fi
+            
+            echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
+            echo "GOOGLE EDGE NODE (The physical server responding to 8.8.8.8):"
+            get_hop_info "$edge_ip" "$edge_latency" "END"
+        fi
+    fi
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
     echo ""
 }
 
 show_help() {
     echo "NETMGR Commands:"
-    echo "  scan [subnet]  - Comprehensive scan using ARP, NBT, and Nmap."
-    echo "  ports          - Show active listening ports (TCP/UDP)."
-    echo "  traceroute     - Deep traceroute with Latency, CIDR, ASN, and Location."
-    echo "  exit           - Exit the netmgr tool."
-    echo "  help           - Show this help message."
+    echo "  scan [subnet]       - Comprehensive scan using ARP, NBT, and Nmap."
+    echo "  ports               - Show active listening ports (TCP/UDP)."
+    echo "  traceroute [target] - Deep traceroute with Edge Node identification."
+    echo "  exit                - Exit the netmgr tool."
+    echo "  help                - Show this help message."
 }
 
 run_command() {
     case "$1" in
         scan) shift; scan_subnet "$@"; ;;
         ports) show_ports; ;;
-        traceroute) run_traceroute; ;;
+        traceroute) shift; run_traceroute "$@"; ;;
         help) show_help; ;;
         exit|quit) exit 0; ;;
         "") ;;
