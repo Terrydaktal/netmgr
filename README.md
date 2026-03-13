@@ -13,7 +13,10 @@ A high-performance, interactive network management and discovery tool designed t
 ### 1. Interactive Shell
 Run `./netmgr` to enter a persistent, `diskpart`-style environment where you can execute multiple commands without restarting the script.
 
-### 2. Network Scanning (`scan [subnet]`)
+### 2. Network Interfaces (`interfaces`)
+Lists all local network interfaces with their current status, IP addresses, MAC addresses, MTU, and system flags in an easy-to-read table.
+
+### 3. Network Scanning (`scan [subnet]`)
 A multi-layered discovery engine that runs the following tools in parallel:
 - **Nmap (SYN Scan):** Fast port discovery and DNS hostname resolution.
 - **ARP-Scan:** Retrieves Layer 2 MAC addresses and hardware manufacturer data (Local Subnet only).

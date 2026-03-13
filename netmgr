@@ -49,6 +49,22 @@ get_local_cidr() {
     fi
 }
 
+show_interfaces() {
+    echo ""
+    echo "Local Network Interfaces:"
+    echo "----------------------------------------------------------------------------------------------------------------"
+    printf "%-12s %-8s %-18s %-18s %-10s %s\n" "Interface" "Status" "IP Address" "MAC Address" "MTU" "Flags"
+    echo "----------------------------------------------------------------------------------------------------------------"
+
+    ip -j addr show | jq -r '.[] | 
+        "\(.ifname) \(.operstate) \((.addr_info[]? | select(.family == "inet") | .local) // "N/A") \(.address) \(.mtu) \(.flags | join(","))"' | \
+    while read -r name state ip mac mtu flags; do
+        printf "%-12s %-8s %-18s %-18s %-10s %s\n" "$name" "$state" "$ip" "$mac" "$mtu" "$flags"
+    done
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo ""
+}
+
 scan_subnet() {
     INTF=$(ip route | grep default | awk '{print $5}')
     MY_IP=$(ip addr show "$INTF" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
@@ -186,12 +202,9 @@ run_traceroute() {
         fi
     done
 
-    # Final Edge Node Identification (Only if target is 8.8.8.8)
     if [[ "$target" == "8.8.8.8" ]]; then
-        # Extract only the line that looks like an IP address (excluding client-subnet)
         edge_ip=$(dig +short TXT o-o.myaddr.l.google.com @8.8.8.8 | tr -d '"' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
         if [ -n "$edge_ip" ]; then
-            # Perform a quick ping to get latency to the real node
             edge_latency=$(ping -c 1 -W 1 "$edge_ip" | grep "time=" | sed -E 's/.*time=([0-9.]+).*/\1/')
             if [ -z "$edge_latency" ]; then edge_latency="N/A"; fi
             
@@ -206,6 +219,7 @@ run_traceroute() {
 
 show_help() {
     echo "NETMGR Commands:"
+    echo "  interfaces          - List all local network interfaces and their details."
     echo "  scan [subnet]       - Comprehensive scan using ARP, NBT, and Nmap."
     echo "  ports               - Show active listening ports (TCP/UDP)."
     echo "  traceroute [target] - Deep traceroute with Edge Node identification."
@@ -215,13 +229,31 @@ show_help() {
 
 run_command() {
     case "$1" in
-        scan) shift; scan_subnet "$@"; ;;
-        ports) show_ports; ;;
-        traceroute) shift; run_traceroute "$@"; ;;
-        help) show_help; ;;
-        exit|quit) exit 0; ;;
-        "") ;;
-        *) echo "Unknown command: $1"; ;;
+        interfaces)
+            show_interfaces
+            ;;
+        scan)
+            shift
+            scan_subnet "$@"
+            ;;
+        ports)
+            show_ports
+            ;;
+        traceroute)
+            shift
+            run_traceroute "$@"
+            ;;
+        help)
+            show_help
+            ;;
+        exit|quit)
+            exit 0
+            ;;
+        "")
+            ;;
+        *)
+            echo "Unknown command: $1"
+            ;;
     esac
 }
 
