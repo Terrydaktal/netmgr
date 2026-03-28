@@ -64,6 +64,121 @@ normalize_mac() {
     '
 }
 
+map_protocol_token() {
+    local token="$1"
+    case "$token" in
+        frame|data|geninfo|ethertype) echo "" ;;
+        radiotap|wlan_radio) echo "Radiotap" ;;
+        wlan) echo "802.11" ;;
+        llc) echo "LLC" ;;
+        eth) echo "Ethernet" ;;
+        ip) echo "IP" ;;
+        ipv6) echo "IPv6" ;;
+        arp) echo "ARP" ;;
+        tcp) echo "TCP" ;;
+        udp) echo "UDP" ;;
+        icmp) echo "ICMP" ;;
+        icmpv6) echo "ICMPv6" ;;
+        bootp|dhcp) echo "DHCP" ;;
+        dns) echo "DNS" ;;
+        mdns) echo "mDNS" ;;
+        ssdp) echo "SSDP" ;;
+        tls|ssl) echo "TLS" ;;
+        quic) echo "QUIC" ;;
+        http|http2|http3) echo "HTTP" ;;
+        eapol) echo "EAPOL" ;;
+        *)
+            echo "$token" | tr '[:lower:]' '[:upper:]'
+            ;;
+    esac
+}
+
+map_ethertype_detail() {
+    local eth_type="$1"
+    case "$eth_type" in
+        0x0800) echo "IP" ;;
+        0x86dd) echo "IPv6" ;;
+        0x0806) echo "ARP" ;;
+        0x888e) echo "EAPOL" ;;
+        0x88cc) echo "LLDP" ;;
+        0x8809) echo "LACP" ;;
+        0x8863) echo "PPPoE-Discovery" ;;
+        0x8864) echo "PPPoE-Session" ;;
+        "") echo "" ;;
+        *)
+            echo "$eth_type"
+            ;;
+    esac
+}
+
+format_protocol_stack() {
+    local proto_chain="$1"
+    local tcp_s="$2"
+    local tcp_d="$3"
+    local udp_s="$4"
+    local udp_d="$5"
+    local eth_type="$6"
+    local app_proto="$7"
+    local stack=""
+    local last=""
+    local token=""
+    local label=""
+    local eth_detail=""
+    local -a proto_parts
+
+    IFS=':' read -r -a proto_parts <<< "$proto_chain"
+    for token in "${proto_parts[@]}"; do
+        label=$(map_protocol_token "$token")
+        [ -z "$label" ] && continue
+        if [ "$label" = "TCP" ] && { [ -n "$tcp_s" ] || [ -n "$tcp_d" ]; }; then
+            label="TCP(${tcp_s:-?}->${tcp_d:-?})"
+        elif [ "$label" = "UDP" ] && { [ -n "$udp_s" ] || [ -n "$udp_d" ]; }; then
+            label="UDP(${udp_s:-?}->${udp_d:-?})"
+        fi
+        if [ "$label" = "$last" ]; then
+            continue
+        fi
+        if [ -z "$stack" ]; then
+            stack="$label"
+        else
+            stack="${stack}<-${label}"
+        fi
+        last="$label"
+    done
+
+    if [ -n "$app_proto" ]; then
+        case "$app_proto" in
+            ''|[0-9]*)
+                ;;
+            "TCP"|"UDP"|"IPv4"|"IPv6"|"Ethernet"|"ARP"|"802.11")
+                ;;
+            *)
+                if [ "$stack" = "Ethernet" ]; then
+                    eth_detail="$app_proto"
+                elif [ "$app_proto" != "$last" ]; then
+                    if [ -z "$stack" ]; then
+                        stack="$app_proto"
+                    else
+                        stack="${stack}<-${app_proto}"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+
+    if [ "$stack" = "Ethernet" ] && [ -z "$eth_detail" ]; then
+        eth_detail=$(map_ethertype_detail "$eth_type")
+    fi
+    if [ "$stack" = "Ethernet" ] && [ -n "$eth_detail" ]; then
+        stack="Ethernet[$eth_detail]"
+    fi
+
+    if [ -z "$stack" ]; then
+        stack="UNKNOWN"
+    fi
+    echo "$stack"
+}
+
 lookup_vendor() {
     local mac_in="$1"
     local mac=""
@@ -138,7 +253,7 @@ update_mac_ip_db_from_scan_rows() {
 
     awk -F'\t' '
         BEGIN { OFS="\t" }
-        FNR == NR {
+        FILENAME == ARGV[1] {
             mac = tolower($1)
             ip = $2
             if (mac ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/ && ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
@@ -163,6 +278,26 @@ update_mac_ip_db_from_scan_rows() {
     mv "$db_tmp" "$MAC_IP_DB"
 }
 
+upsert_mac_ip_db_pair() {
+    local ip="$1"
+    local mac_in="$2"
+    local mac_norm=""
+    local one_row_tmp=""
+
+    mac_norm=$(normalize_mac "$mac_in")
+    if [ -z "$mac_norm" ]; then
+        return 0
+    fi
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 0
+    fi
+
+    one_row_tmp=$(mktemp)
+    printf "%s\tunknown\t%s\tunknown\tn/a\n" "$ip" "$mac_norm" > "$one_row_tmp"
+    update_mac_ip_db_from_scan_rows "$one_row_tmp"
+    rm -f "$one_row_tmp"
+}
+
 log_ok() {
     printf "\033[1;32m[OK]\033[0m %s\n" "$*"
 }
@@ -171,7 +306,35 @@ log_err() {
     printf "\033[1;31m[ERR]\033[0m %s\n" "$*"
 }
 
+ensure_sudo_session() {
+    if [ "$EUID" -eq 0 ]; then
+        return 0
+    fi
+    if sudo -v; then
+        return 0
+    fi
+    echo "Error: sudo authentication failed."
+    return 1
+}
+
 show_interfaces() {
+    local iw_cmd=""
+
+    if command -v iw >/dev/null 2>&1; then
+        iw_cmd=$(command -v iw)
+    elif [ -x /usr/sbin/iw ]; then
+        iw_cmd="/usr/sbin/iw"
+    elif [ -x /sbin/iw ]; then
+        iw_cmd="/sbin/iw"
+    elif [ -x /usr/bin/iw ]; then
+        iw_cmd="/usr/bin/iw"
+    elif [ -x /bin/iw ]; then
+        iw_cmd="/bin/iw"
+    fi
+    if [ -n "$iw_cmd" ] && [ "$EUID" -ne 0 ]; then
+        ensure_sudo_session || return 1
+    fi
+
     echo ""
     echo "Local Network Interfaces:"
     echo "----------------------------------------------------------------------------------------------------------------"
@@ -212,6 +375,38 @@ show_interfaces() {
     ) | column -t
     echo "----------------------------------------------------------------------------------------------------------------"
     echo ""
+    echo "sudo iw dev"
+    echo "----------------------------------------------------------------------------------------------------------------"
+    if [ -n "$iw_cmd" ]; then
+        if [ "$EUID" -eq 0 ]; then
+            "$iw_cmd" dev
+        else
+            sudo "$iw_cmd" dev
+        fi
+    else
+        echo "iw: command not found"
+    fi
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo ""
+    echo "lspci -knn | grep -iA2 net"
+    echo "----------------------------------------------------------------------------------------------------------------"
+    if command -v lspci >/dev/null 2>&1; then
+        lspci -knn | grep -iA2 net || echo "No PCI network controllers matched."
+    else
+        echo "lspci: command not found"
+    fi
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo ""
+    echo "ip route show"
+    echo "----------------------------------------------------------------------------------------------------------------"
+    ip route show
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo ""
+    echo "ip addr"
+    echo "----------------------------------------------------------------------------------------------------------------"
+    ip addr
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo ""
 }
 
 scan_subnet() {
@@ -221,10 +416,26 @@ scan_subnet() {
     local resolve_hostnames=0
     local route_probe=""
     local route_intf=""
+    local MY_IP=""
+    local MY_MAC=""
+    local SUBNET=""
+    local TARGET=""
+    local INTF=""
+    local tmp_nmap=""
+    local tmp_rows=""
+    local tmp_resolved=""
     local tmp_ports_nmap=""
     local tmp_ports_map=""
     local tmp_rows_ports=""
     local tmp_ips=""
+    local tmp_event_fifo=""
+    local tshark_filter=""
+    local nmap_delay="${NETMGR_SCAN_NMAP_DELAY:-2}"
+    local scan_interrupted=0
+    local nmap_pid=""
+    local tshark_pid=""
+    local consumer_pid=""
+    declare -A VENDOR_CACHE
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -245,7 +456,6 @@ scan_subnet() {
         shift
     done
 
-    local INTF=""
     if [ -n "$intf_arg" ]; then
         INTF="$intf_arg"
     else
@@ -274,7 +484,10 @@ scan_subnet() {
 
     MY_IP=$(ip addr show "$INTF" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
     MY_MAC=$(cat "/sys/class/net/$INTF/address" 2>/dev/null)
-    SUBNET=$(ip addr show "$INTF" | awk '/inet / {print $2}' | head -n 1)
+    SUBNET=$(ip route show dev "$INTF" proto kernel scope link | awk 'NR==1 {print $1}')
+    if [ -z "$SUBNET" ]; then
+        SUBNET=$(ip addr show "$INTF" | awk '/inet / {print $2}' | head -n 1)
+    fi
     TARGET=${target_arg:-$SUBNET}
 
     if [ -z "$TARGET" ]; then
@@ -282,9 +495,14 @@ scan_subnet() {
         return 1
     fi
 
+    ensure_sudo_session || return 1
+
     echo ""
     echo "Using Interface: $INTF ($MY_IP)"
     echo "Scanning Subnet: $TARGET..."
+    echo "Streaming discovery continuously (nmap loop + tshark in parallel). Press Ctrl+C to stop."
+    echo "-----------------------------------------------------------------------------------------------------------------------------------"
+    printf "Time       SRC     IP_Address      MAC_Address         Hostname             Vendor\n"
     echo "-----------------------------------------------------------------------------------------------------------------------------------"
 
     tmp_nmap=$(mktemp)
@@ -294,70 +512,242 @@ scan_subnet() {
     tmp_ports_map=$(mktemp)
     tmp_rows_ports=$(mktemp)
     tmp_ips=$(mktemp)
-
-    if ! sudo nmap -sn -PS22,80,443 -PA21,23,3389 -PU40125 --max-retries 5 --stats-every 10s -e "$INTF" "$TARGET" > "$tmp_nmap" 2>/dev/null; then
-        echo "Error: nmap scan failed. Check sudo privileges, interface, and target subnet."
-        rm -f "$tmp_nmap" "$tmp_rows" "$tmp_resolved" "$tmp_ports_nmap" "$tmp_ports_map" "$tmp_rows_ports" "$tmp_ips"
-        return 1
+    : > "$tmp_rows"
+    tmp_event_fifo=$(mktemp -u)
+    mkfifo "$tmp_event_fifo"
+    if [[ "$TARGET" == */* ]]; then
+        tshark_filter="ip and (src net ${TARGET} or dst net ${TARGET})"
+    elif [[ "$TARGET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        tshark_filter="ip and (src host ${TARGET} or dst host ${TARGET})"
+    else
+        tshark_filter="ip"
     fi
 
-    awk -v my_ip="$MY_IP" -v my_mac="$MY_MAC" '
-        /^Nmap scan report for / {
-            report = $0
-            sub(/^Nmap scan report for /, "", report)
+    upsert_scan_row() {
+        local row_ip="$1"
+        local row_host="$2"
+        local row_mac="$3"
+        local row_vendor="$4"
+        local row_ports="$5"
+        local row_tmp=""
 
-            current_ip = ""
-            host = "unknown"
+        [ -z "$row_ip" ] && return 0
+        row_host=${row_host:-unknown}
+        row_mac=${row_mac:-unknown}
+        row_vendor=${row_vendor:-unknown}
+        row_ports=${row_ports:-n/a}
 
-            if (match(report, /\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)$/)) {
-                current_ip = substr(report, RSTART + 1, RLENGTH - 2)
-                host = substr(report, 1, RSTART - 2)
-            } else if (report ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                current_ip = report
-            }
+        row_tmp=$(mktemp)
+        awk -F'\t' -v ip="$row_ip" -v h="$row_host" -v m="$row_mac" -v v="$row_vendor" -v p="$row_ports" '
+            BEGIN { OFS="\t"; updated = 0 }
+            {
+                if ($1 == ip) {
+                    if (h != "" && h != "unknown") $2 = h
+                    else if ($2 == "") $2 = "unknown"
 
-            if (current_ip != "") {
-                names[current_ip] = host
-            }
-            next
-        }
-        /^Host is up/ {
-            if (current_ip != "") {
-                active[current_ip] = 1
-            }
-            next
-        }
-        /^MAC Address: / {
-            if (current_ip == "") next
+                    if (m != "" && m != "unknown") $3 = m
+                    else if ($3 == "") $3 = "unknown"
 
-            mac = $0
-            sub(/^MAC Address: /, "", mac)
-            sub(/ .*/, "", mac)
-            if (mac != "") {
-                macs[current_ip] = mac
-            }
+                    if (v != "" && v != "unknown") $4 = v
+                    else if ($4 == "") $4 = "unknown"
 
-            vendor = "unknown"
-            if (match($0, /\(.*\)$/)) {
-                vendor = substr($0, RSTART + 1, RLENGTH - 2)
-            }
-            vendors[current_ip] = vendor
-        }
-        END {
-            if (my_ip != "" && active[my_ip] && my_mac != "" && macs[my_ip] == "") {
-                macs[my_ip] = my_mac
-                vendors[my_ip] = "(This Computer)"
-            }
+                    if (p != "" && p != "n/a") $5 = p
+                    else if ($5 == "") $5 = "n/a"
 
-            for (ip in active) {
-                disp_h = (names[ip] != "") ? names[ip] : "unknown"
-                mac = (macs[ip] != "") ? macs[ip] : "unknown"
-                vendor = (vendors[ip] != "") ? vendors[ip] : "unknown"
-                p_list = "n/a"
-                printf "%s\t%s\t%s\t%s\t%s\n", ip, disp_h, mac, vendor, p_list
+                    updated = 1
+                }
+                print
             }
-        }
-        ' "$tmp_nmap" | sort -V > "$tmp_rows"
+            END {
+                if (!updated) {
+                    print ip, h, m, v, p
+                }
+            }
+        ' "$tmp_rows" > "$row_tmp"
+        mv "$row_tmp" "$tmp_rows"
+    }
+
+    cleanup_scan_stream() {
+        if [ -n "$nmap_pid" ]; then
+            kill -TERM "$nmap_pid" >/dev/null 2>&1 || true
+            pkill -TERM -P "$nmap_pid" >/dev/null 2>&1 || true
+        fi
+        if [ -n "$tshark_pid" ]; then
+            kill -TERM "$tshark_pid" >/dev/null 2>&1 || true
+            pkill -TERM -P "$tshark_pid" >/dev/null 2>&1 || true
+        fi
+        if [ -n "$consumer_pid" ]; then
+            kill -TERM "$consumer_pid" >/dev/null 2>&1 || true
+            pkill -TERM -P "$consumer_pid" >/dev/null 2>&1 || true
+        fi
+
+        sleep 0.2
+
+        if [ -n "$nmap_pid" ] && kill -0 "$nmap_pid" >/dev/null 2>&1; then
+            kill -KILL "$nmap_pid" >/dev/null 2>&1 || true
+            pkill -KILL -P "$nmap_pid" >/dev/null 2>&1 || true
+        fi
+        if [ -n "$tshark_pid" ] && kill -0 "$tshark_pid" >/dev/null 2>&1; then
+            kill -KILL "$tshark_pid" >/dev/null 2>&1 || true
+            pkill -KILL -P "$tshark_pid" >/dev/null 2>&1 || true
+        fi
+        if [ -n "$consumer_pid" ] && kill -0 "$consumer_pid" >/dev/null 2>&1; then
+            kill -KILL "$consumer_pid" >/dev/null 2>&1 || true
+            pkill -KILL -P "$consumer_pid" >/dev/null 2>&1 || true
+        fi
+
+        [ -n "$nmap_pid" ] && wait "$nmap_pid" 2>/dev/null || true
+        [ -n "$tshark_pid" ] && wait "$tshark_pid" 2>/dev/null || true
+        [ -n "$consumer_pid" ] && wait "$consumer_pid" 2>/dev/null || true
+
+        rm -f "$tmp_event_fifo" >/dev/null 2>&1 || true
+    }
+
+    trap 'scan_interrupted=1; cleanup_scan_stream' INT TERM
+
+    (
+        declare -A streamed_macs
+        while IFS=$'\t' read -r src ip host mac vendor rest; do
+            local first_octet=""
+            [ -n "$rest" ] && continue
+            if [ "$src" != "NMAP" ] && [ "$src" != "TSHARK" ]; then
+                continue
+            fi
+
+            local_mac=$(normalize_mac "$mac")
+            [ -z "$host" ] && host="unknown"
+            [ -z "$vendor" ] && vendor="unknown"
+            if [ -z "$local_mac" ]; then
+                continue
+            fi
+            if [ "$local_mac" = "ff:ff:ff:ff:ff:ff" ]; then
+                continue
+            fi
+            first_octet=${local_mac%%:*}
+            if [ $((16#$first_octet & 1)) -eq 1 ]; then
+                continue
+            fi
+            if [ "$vendor" = "unknown" ]; then
+                vendor=$(lookup_vendor "$local_mac")
+            fi
+
+            if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                upsert_scan_row "$ip" "$host" "$local_mac" "$vendor" "n/a"
+                upsert_mac_ip_db_pair "$ip" "$local_mac"
+                if [ -z "${streamed_macs[$local_mac]+x}" ]; then
+                    streamed_macs["$local_mac"]=1
+                    printf "[%s] %-7s %-15s %-18s %-20s %s\n" "$(date +%T)" "$src" "$ip" "$local_mac" "$host" "$vendor"
+                fi
+            fi
+        done < "$tmp_event_fifo"
+    ) &
+    consumer_pid=$!
+
+    (
+        while true; do
+            sudo nmap -sn -PS22,80,443 -PA21,23,3389 -PU40125 --max-retries 5 --stats-every 10s -e "$INTF" "$TARGET" 2>/dev/null | awk -v my_ip="$MY_IP" -v my_mac="$MY_MAC" '
+                /^Nmap scan report for / {
+                    report = $0
+                    sub(/^Nmap scan report for /, "", report)
+                    current_ip = ""
+                    host = "unknown"
+                    if (match(report, /\([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)$/)) {
+                        current_ip = substr(report, RSTART + 1, RLENGTH - 2)
+                        host = substr(report, 1, RSTART - 2)
+                    } else if (report ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        current_ip = report
+                    }
+                    if (current_ip != "") names[current_ip] = host
+                    next
+                }
+                /^Host is up/ {
+                    if (current_ip != "") active[current_ip] = 1
+                    next
+                }
+                /^MAC Address:/ {
+                    if (current_ip == "") next
+                    mac = $0
+                    sub(/^MAC Address: /, "", mac)
+                    sub(/ .*/, "", mac)
+                    if (mac != "") macs[current_ip] = mac
+                    vendor = "unknown"
+                    if (match($0, /\(.*\)$/)) vendor = substr($0, RSTART + 1, RLENGTH - 2)
+                    vendors[current_ip] = vendor
+                }
+                END {
+                    if (my_ip != "" && active[my_ip] && my_mac != "" && macs[my_ip] == "") {
+                        macs[my_ip] = my_mac
+                        vendors[my_ip] = "(This Computer)"
+                    }
+                    for (ip in active) {
+                        disp_h = (names[ip] != "") ? names[ip] : "unknown"
+                        mac = (macs[ip] != "") ? macs[ip] : "unknown"
+                        vendor = (vendors[ip] != "") ? vendors[ip] : "unknown"
+                        printf "NMAP\t%s\t%s\t%s\t%s\n", ip, disp_h, mac, vendor
+                    }
+                }
+            '
+            sleep "$nmap_delay"
+        done
+    ) > "$tmp_event_fifo" &
+    nmap_pid=$!
+
+    if command -v tshark >/dev/null 2>&1; then
+        (
+            sudo tshark -l -n -s 0 -i "$INTF" -f "$tshark_filter" -T fields -E separator=$'\t' -e eth.src -e ip.src -e eth.dst -e ip.dst 2>/dev/null | stdbuf -oL uniq | awk -F'\t' '
+                function emit_pair(ip, mac) {
+                    if (ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/ && mac != "") {
+                        printf "TSHARK\t%s\tunknown\t%s\tunknown\n", ip, mac
+                    }
+                }
+                NF >= 4 {
+                    emit_pair($2, $1)
+                    emit_pair($4, $3)
+                }
+            '
+        ) > "$tmp_event_fifo" &
+        tshark_pid=$!
+    else
+        echo "Warning: tshark stream disabled (missing tshark)."
+    fi
+
+    while [ "$scan_interrupted" -eq 0 ]; do
+        nmap_alive=0
+        tshark_alive=0
+        consumer_alive=0
+
+        if [ -n "$nmap_pid" ] && kill -0 "$nmap_pid" >/dev/null 2>&1; then
+            nmap_alive=1
+        fi
+        if [ -n "$tshark_pid" ] && kill -0 "$tshark_pid" >/dev/null 2>&1; then
+            tshark_alive=1
+        fi
+        if [ -n "$consumer_pid" ] && kill -0 "$consumer_pid" >/dev/null 2>&1; then
+            consumer_alive=1
+        fi
+
+        if [ "$nmap_alive" -eq 0 ] && [ "$tshark_alive" -eq 0 ]; then
+            break
+        fi
+        if [ "$consumer_alive" -eq 0 ]; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    cleanup_scan_stream
+    trap - INT TERM
+    rm -f "$tmp_event_fifo"
+
+    if [ "$scan_interrupted" -eq 1 ]; then
+        return 130
+    fi
+
+    if [ -n "$MY_IP" ] && [ -n "$MY_MAC" ]; then
+        if ! awk -F'\t' -v ip="$MY_IP" '$1==ip {found=1} END {exit found ? 0 : 1}' "$tmp_rows"; then
+            upsert_scan_row "$MY_IP" "unknown" "$MY_MAC" "(This Computer)" "n/a"
+        fi
+    fi
 
     if [ "$scan_ports" -eq 1 ]; then
         cut -f1 "$tmp_rows" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' > "$tmp_ips"
@@ -422,18 +812,26 @@ scan_subnet() {
         cp "$tmp_rows" "$tmp_resolved"
     fi
 
+    echo ""
+    echo "Final Scan Table:"
+    echo "-----------------------------------------------------------------------------------------------------------------------------------"
     (
         printf "IP_Address\tHostname/Identity\tMAC_Address\tManufacturer\tPorts\n"
         sort -V "$tmp_resolved"
     ) | column -t -s $'\t'
 
-    rm -f "$tmp_nmap" "$tmp_rows" "$tmp_resolved" "$tmp_ports_nmap" "$tmp_ports_map" "$tmp_rows_ports" "$tmp_ips"
+    rm -f "$tmp_nmap" "$tmp_rows" "$tmp_resolved" "$tmp_ports_nmap" "$tmp_ports_map" "$tmp_rows_ports" "$tmp_ips" "$tmp_event_fifo"
     echo "-----------------------------------------------------------------------------------------------------------------------------------"
     echo ""
+
+    if [ "$scan_interrupted" -eq 1 ]; then
+        return 130
+    fi
 }
 
 show_ports() {
-    sudo ss -tulpn | column -t
+    ensure_sudo_session || return 1
+    sudo ss -tuanp | sort -k 1,1
 }
 
 bssid_scan() {
@@ -548,6 +946,7 @@ bssid_scan() {
 listen_subnet() {
     local INTERFACE="wlp8s0"
     local MODE="managed"
+    local DEDUPE=0
     local BSSID=""
     local TARGET_CHAN=""
     local BAND=""
@@ -555,6 +954,7 @@ listen_subnet() {
     local line
     local mac
     local vendor
+    local vendor_disp
     local discovered_bssid
     local CAPTURE_IF=""
     local bssid_lc=""
@@ -576,6 +976,8 @@ listen_subnet() {
     local sa=""
     local ta=""
     local da=""
+    local proto=""
+    local packet_proto=""
     local sa_norm=""
     local ta_norm=""
     local da_norm=""
@@ -587,6 +989,12 @@ listen_subnet() {
     local display_ssid=""
     local display_chan=""
     local selected_ssid=""
+    local decrypt_ssid=""
+    local decrypt_psk=""
+    local decrypt_uuid=""
+    local conn_ssid=""
+    local conn_psk=""
+    local psk_field=""
     local monitor_cleanup_done=0
     local monitor_interrupted=0
     local dummy_uuid=""
@@ -600,6 +1008,7 @@ listen_subnet() {
     local -a PRIV_CMD
     local -a sniff_cmd
     local -a hop_channels
+    local -a tshark_dec_opts
     declare -A seen_devices
     declare -A VENDOR_CACHE
     declare -A BSSID_TO_SSID
@@ -610,11 +1019,14 @@ listen_subnet() {
             managed|monitor)
                 MODE="$1"
                 ;;
+            --dedupe)
+                DEDUPE=1
+                ;;
             --bssid)
                 shift
                 if [ -z "${1:-}" ]; then
                     echo "Error: --bssid requires a value."
-                    echo "Usage: netmgr listen [interface] [managed|monitor] [BSSID] [--channel <n>] [--bssid <mac>]"
+                    echo "Usage: netmgr listen [interface] [managed|monitor] [--channel <n>] [--bssid <mac>] [--dedupe]"
                     return 1
                 fi
                 BSSID="$1"
@@ -623,7 +1035,7 @@ listen_subnet() {
                 shift
                 if [ -z "${1:-}" ]; then
                     echo "Error: --channel requires a value."
-                    echo "Usage: netmgr listen [interface] [managed|monitor] [BSSID] [--channel <n>] [--bssid <mac>]"
+                    echo "Usage: netmgr listen [interface] [managed|monitor] [--channel <n>] [--bssid <mac>] [--dedupe]"
                     return 1
                 fi
                 TARGET_CHAN="$1"
@@ -649,7 +1061,7 @@ listen_subnet() {
     if [ "$MODE" = "monitor" ] && [ -n "$BSSID" ]; then
         if [[ ! "$BSSID" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
             echo "Error: Invalid BSSID format: $BSSID"
-            echo "Usage: netmgr listen [interface] monitor [BSSID] [--channel <n>] [--bssid <mac>]"
+            echo "Usage: netmgr listen [interface] monitor [--channel <n>] [--bssid <mac>] [--dedupe]"
             return 1
         fi
         bssid_lc=$(echo "$BSSID" | tr '[:upper:]' '[:lower:]')
@@ -751,28 +1163,117 @@ listen_subnet() {
     fi
 
     if [ "$MODE" = "managed" ]; then
-        sniff_cmd=("${PRIV_CMD[@]}" tcpdump -l -i "$INTERFACE" -n -e 'arp or (udp and (port 67 or port 1900 or port 3702 or port 5353 or port 10001 or port 15600 or port 56700 or port 57621))')
+        if command -v tshark >/dev/null 2>&1; then
+            if [ "$DEDUPE" -eq 1 ]; then
+                log_ok "Listening on ${INTERFACE} in managed mode (all traffic, dedupe mode)..."
+            else
+                log_ok "Listening on ${INTERFACE} in managed mode (all traffic, full stack shown)..."
+            fi
+            log_ok "Using tshark decoder for detailed protocol stack."
+            echo "--------------------------------------------------------------------------------"
+            if [ "$DEDUPE" -eq 0 ]; then
+                printf "Time       MAC_Address         IP_Address                               Vendor                         Protocol_Stack\n"
+                echo "--------------------------------------------------------------------------------"
+            fi
 
-        echo "Listening on ${INTERFACE} in managed mode for ARP and IoT chatter (mDNS, SSDP, DHCP, WS-Discovery, Sonos, Spotify Connect, LIFX, UniFi)..."
-        echo "--------------------------------------------------------------------------------"
+            sniff_cmd=("${PRIV_CMD[@]}" tshark -l -n -i "$INTERFACE" -T fields -E separator='|' -E occurrence=f -e eth.src -e ip.src -e ipv6.src -e frame.protocols -e tcp.srcport -e tcp.dstport -e udp.srcport -e udp.dstport -e eth.type -e _ws.col.Protocol)
 
-        "${sniff_cmd[@]}" | while read -r line; do
-            mac=$(echo "$line" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n 1)
-            mac=$(normalize_mac "$mac")
+            "${sniff_cmd[@]}" \
+                2> >(while IFS= read -r tshark_msg; do
+                    case "$tshark_msg" in
+                        Capturing\ on\ *)
+                            log_ok "$tshark_msg"
+                            ;;
+                        Running\ as\ user\ \"root\"*)
+                            ;;
+                        "")
+                            ;;
+                        *)
+                            log_err "$tshark_msg"
+                            ;;
+                    esac
+                done) | while IFS='|' read -r mac ip4 ip6 proto_chain tcp_s tcp_d udp_s udp_d eth_type app_proto; do
+                mac=$(normalize_mac "$mac")
+                if [ -z "$mac" ]; then
+                    continue
+                fi
 
-            if [[ -n "$mac" && -z "${seen_devices[$mac]}" ]]; then
-                seen_devices[$mac]=1
                 vendor=$(lookup_vendor "$mac")
+                vendor_disp=$(printf "%.31s" "$vendor")
+                ip_for_mac="$ip4"
+                [ -z "$ip_for_mac" ] && ip_for_mac="$ip6"
+                [ -z "$ip_for_mac" ] && ip_for_mac=$(lookup_ip_from_db "$mac")
+                [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
+                packet_proto=$(format_protocol_stack "$proto_chain" "$tcp_s" "$tcp_d" "$udp_s" "$udp_d" "$eth_type" "$app_proto")
+                if [[ "$INTERFACE" == wlp* ]]; then
+                    packet_proto="${packet_proto//Ethernet/Synthetic Eth}"
+                fi
+
+                if [ "$DEDUPE" -eq 1 ]; then
+                    if [[ -n "${seen_devices[$mac]}" ]]; then
+                        continue
+                    fi
+                    seen_devices[$mac]=1
+                    printf "[%s] NEW HOST DETECTED | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp"
+                    sleep 1
+                else
+                    printf "[%s] %-18s %-39s %-31s %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp" "$packet_proto"
+                fi
+            done
+        else
+            if [ "$DEDUPE" -eq 1 ]; then
+                log_ok "Listening on ${INTERFACE} in managed mode (all traffic, dedupe mode)..."
+            else
+                log_ok "Listening on ${INTERFACE} in managed mode (all traffic, protocol shown)..."
+            fi
+            log_err "tshark is not installed; falling back to basic parser."
+            echo "--------------------------------------------------------------------------------"
+            if [ "$DEDUPE" -eq 0 ]; then
+                printf "Time       MAC_Address         IP_Address                               Vendor                         Protocol_Stack\n"
+                echo "--------------------------------------------------------------------------------"
+            fi
+            sniff_cmd=("${PRIV_CMD[@]}" tcpdump -l -i "$INTERFACE" -n -e)
+            "${sniff_cmd[@]}" \
+                2> >(while IFS= read -r tcpdump_msg; do
+                    case "$tcpdump_msg" in
+                        "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode")
+                            log_ok "tcpdump capture started (compact decode mode)."
+                            ;;
+                        listening\ on\ *)
+                            log_ok "$tcpdump_msg"
+                            ;;
+                        "")
+                            ;;
+                        *)
+                            log_err "$tcpdump_msg"
+                            ;;
+                    esac
+                done) | while read -r line; do
+                mac=$(echo "$line" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n 1)
+                mac=$(normalize_mac "$mac")
+                [ -z "$mac" ] && continue
+
+                vendor=$(lookup_vendor "$mac")
+                vendor_disp=$(printf "%.31s" "$vendor")
                 ip_for_mac=$(lookup_ip_from_db "$mac")
                 [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
+                packet_proto="UNKNOWN"
 
-                printf "[%s] NEW HOST DETECTED | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor"
-                sleep 1
-            fi
-        done
+                if [ "$DEDUPE" -eq 1 ]; then
+                    if [[ -n "${seen_devices[$mac]}" ]]; then
+                        continue
+                    fi
+                    seen_devices[$mac]=1
+                    printf "[%s] NEW HOST DETECTED | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp"
+                    sleep 1
+                else
+                    printf "[%s] %-18s %-39s %-31s %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp" "$packet_proto"
+                fi
+            done
+        fi
         sniff_rc=${PIPESTATUS[0]}
         if [ "$sniff_rc" -ne 0 ] && [ "$sniff_rc" -ne 130 ]; then
-            echo "Error: tcpdump failed on interface ${INTERFACE}."
+            log_err "Managed capture failed on interface ${INTERFACE}."
             return "$sniff_rc"
         fi
         return 0
@@ -780,7 +1281,7 @@ listen_subnet() {
 
     if [ "$MODE" != "monitor" ]; then
         echo "Error: Unknown listen mode: $MODE"
-        echo "Usage: netmgr listen [interface] [managed|monitor] [BSSID] [--channel <n>] [--bssid <mac>]"
+        echo "Usage: netmgr listen [interface] [managed|monitor] [--channel <n>] [--bssid <mac>] [--dedupe]"
         return 1
     fi
 
@@ -849,6 +1350,46 @@ listen_subnet() {
 
     log_ok "Starting monitor mode on ${INTERFACE}..."
     prev_conn_uuid=$(nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$INTERFACE" '$2==dev {print $1; exit}')
+    if [ -n "$prev_conn_uuid" ]; then
+        decrypt_ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+        [ -z "$decrypt_ssid" ] && decrypt_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+        for psk_field in 802-11-wireless-security.psk wifi-sec.psk 802-11-wireless-security.sae-password wifi-sec.sae-password; do
+            decrypt_psk=$(nmcli --show-secrets -g "$psk_field" connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+            if [ -z "$decrypt_psk" ]; then
+                decrypt_psk=$("${PRIV_CMD[@]}" nmcli --show-secrets -g "$psk_field" connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+            fi
+            [ -n "$decrypt_psk" ] && break
+        done
+    fi
+    if [ -z "$decrypt_ssid" ] && [ -n "$selected_ssid" ]; then
+        decrypt_ssid="$selected_ssid"
+    fi
+    if [ -z "$decrypt_psk" ] && [ -n "$decrypt_ssid" ]; then
+        while read -r decrypt_uuid; do
+            [ -z "$decrypt_uuid" ] && continue
+            conn_ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+            [ -z "$conn_ssid" ] && conn_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+            [ "$conn_ssid" != "$decrypt_ssid" ] && continue
+            conn_psk=""
+            for psk_field in 802-11-wireless-security.psk wifi-sec.psk 802-11-wireless-security.sae-password wifi-sec.sae-password; do
+                conn_psk=$(nmcli --show-secrets -g "$psk_field" connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+                if [ -z "$conn_psk" ]; then
+                    conn_psk=$("${PRIV_CMD[@]}" nmcli --show-secrets -g "$psk_field" connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+                fi
+                [ -n "$conn_psk" ] && break
+            done
+            [ -z "$conn_psk" ] && continue
+            decrypt_psk="$conn_psk"
+            break
+        done < <(nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
+    fi
+    tshark_dec_opts=()
+    if [ -n "$decrypt_ssid" ] && [ -n "$decrypt_psk" ]; then
+        tshark_dec_opts=(-o "wlan.enable_decryption:TRUE" -o "uat:80211_keys:\"wpa-pwd\",\"${decrypt_psk}:${decrypt_ssid}\"")
+        log_ok "Using saved WPA key for SSID ${decrypt_ssid}; enabling higher-layer protocol decode."
+    else
+        log_err "No saved WPA key available for monitor decryption; protocol may remain 802.11."
+    fi
     if [ "${NETMGR_AIRMON_KILL:-0}" = "1" ] && command -v airmon-ng >/dev/null 2>&1; then
         "${PRIV_CMD[@]}" airmon-ng check kill >/dev/null 2>&1 || true
     fi
@@ -944,16 +1485,20 @@ listen_subnet() {
         log_ok "Monitor mode active on ${INTERFACE}. Capture interface: ${CAPTURE_IF}. Showing devices from all BSSIDs."
     fi
     echo "--------------------------------------------------------------------------------"
+    printf "Time       BSSID               SSID                 CH   MAC_Address         IP_Address      Vendor               Protocol\n"
+    echo "--------------------------------------------------------------------------------"
     trap 'monitor_interrupted=1; monitor_cleanup' INT TERM
 
     tmp_found=$(mktemp)
     tmp_trunc=$(mktemp)
-    sniff_cmd=("${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" -T fields -E separator=$'\t' -E occurrence=f -e wlan.bssid -e wlan.sa -e wlan.ta -e wlan.da)
-    "${sniff_cmd[@]}" 2>/dev/null | while IFS=$'\t' read -r frame_bssid sa ta da; do
+    sniff_cmd=("${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" "${tshark_dec_opts[@]}" -T fields -E separator=$'\t' -E occurrence=f -e wlan.bssid -e wlan.sa -e wlan.ta -e wlan.da -e _ws.col.Protocol)
+    "${sniff_cmd[@]}" 2>/dev/null | while IFS=$'\t' read -r frame_bssid sa ta da proto; do
         frame_bssid=$(normalize_mac "$frame_bssid")
         sa_norm=$(normalize_mac "$sa")
         ta_norm=$(normalize_mac "$ta")
         da_norm=$(normalize_mac "$da")
+        packet_proto="$proto"
+        [ -z "$packet_proto" ] && packet_proto="802.11"
 
         discovered_bssid="$bssid_lc"
         if [ -z "$discovered_bssid" ]; then
@@ -974,14 +1519,16 @@ listen_subnet() {
                 continue
             fi
 
-            key="${discovered_bssid}|${maybe_mac}"
-            if [ -n "${seen_devices[$key]}" ]; then
-                continue
+            if [ "$DEDUPE" -eq 1 ]; then
+                if [ -n "${seen_devices[$maybe_mac]}" ]; then
+                    continue
+                fi
+                seen_devices[$maybe_mac]=1
             fi
-            seen_devices[$key]=1
             echo 1 >> "$tmp_found"
 
             vendor=$(lookup_vendor "$maybe_mac")
+            vendor_disp=$(printf "%.31s" "$vendor")
             ip_for_mac=$(lookup_ip_from_db "$maybe_mac")
             [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
             display_bssid="$discovered_bssid"
@@ -995,9 +1542,9 @@ listen_subnet() {
             [ -z "$display_chan" ] && display_chan="${TARGET_CHAN:-hop}"
 
             if [ "$discovered_bssid" = "unknown" ]; then
-                printf "[%s] BSSID: %-17s | SSID: %-20s | CH: %-4s | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "unknown" "$display_ssid" "$display_chan" "$maybe_mac" "$ip_for_mac" "$vendor"
+                printf "[%s] %-19s %-20s %-4s %-18s %-15s %-31s %s\n" "$(date +%T)" "unknown" "$display_ssid" "$display_chan" "$maybe_mac" "$ip_for_mac" "$vendor_disp" "$packet_proto"
             else
-                printf "[%s] BSSID: %-17s | SSID: %-20s | CH: %-4s | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "$display_bssid" "$display_ssid" "$display_chan" "$maybe_mac" "$ip_for_mac" "$vendor"
+                printf "[%s] %-19s %-20s %-4s %-18s %-15s %-31s %s\n" "$(date +%T)" "$display_bssid" "$display_ssid" "$display_chan" "$maybe_mac" "$ip_for_mac" "$vendor_disp" "$packet_proto"
             fi
         done
     done
@@ -1057,6 +1604,8 @@ fingerprint_host() {
         return 1
     fi
 
+    ensure_sudo_session || return 1
+
     if [ "$fast_mode" -eq 1 ]; then
         sudo nmap -A --top-ports 100 -T4 "$target"
     else
@@ -1102,33 +1651,225 @@ get_hop_info() {
 }
 
 run_traceroute() {
-    local input_target="${1:-8.8.8.8}"
+    local trace_intf=""
+    local input_target="8.8.8.8"
     local target="$input_target"
     local resolved_target=""
+    local mtr_intf_args=()
+    local mtr_family_args=()
+    local hop=0
+    local route_line=""
+    local route_dev=""
+    local route_via=""
+    local route_src=""
+    local ip_candidate=""
+    local happy_ip=""
+    local happy_scheme=""
+    local happy_family=""
+    local happy_reason=""
+    local curl_out=""
+    local v4_routable=""
+    local v6_routable=""
+    local v4_route_line=""
+    local v6_route_line=""
+    local v4_route_dev=""
+    local v6_route_dev=""
+    local diag_intf=""
+    local diag_v4_addr=""
+    local diag_v6_addr=""
+    local diag_v4_default=""
+    local diag_v6_default=""
+    local -a resolved_ips=()
+    local -a resolved_v4=()
+    local -a resolved_v6=()
 
-    if [[ ! "$input_target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && ! "$input_target" =~ : ]]; then
-        resolved_target=$(getent ahostsv4 "$input_target" | awk 'NR==1 {print $1}')
-        if [ -z "$resolved_target" ]; then
-            resolved_target=$(getent ahosts "$input_target" | awk 'NR==1 {print $1}')
+    if [ $# -ge 1 ]; then
+        if ip link show "$1" >/dev/null 2>&1; then
+            trace_intf="$1"
+            if [ $# -ge 2 ]; then
+                input_target="$2"
+            fi
+        else
+            input_target="$1"
         fi
-        if [ -z "$resolved_target" ]; then
+    fi
+    target="$input_target"
+    if [[ ! "$input_target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && ! "$input_target" =~ : ]]; then
+        mapfile -t resolved_ips < <(getent ahosts "$input_target" | awk '{print $1}' | awk '!seen[$0]++')
+        if [ "${#resolved_ips[@]}" -eq 0 ]; then
             echo "Error: Could not resolve target hostname: $input_target"
             return 1
         fi
-        target="$resolved_target"
+
+        for ip_candidate in "${resolved_ips[@]}"; do
+            if [[ "$ip_candidate" == *:* ]]; then
+                resolved_v6+=("$ip_candidate")
+            else
+                resolved_v4+=("$ip_candidate")
+            fi
+        done
+
+        log_ok "Happy Eyeballs probe: curl --happy-eyeballs-timeout-ms 200 ${input_target}"
+        if [ "${#resolved_v6[@]}" -gt 0 ]; then
+            log_ok "AAAA candidates: ${resolved_v6[*]}"
+        fi
+        if [ "${#resolved_v4[@]}" -gt 0 ]; then
+            log_ok "A candidates: ${resolved_v4[*]}"
+        fi
+
+        if command -v curl >/dev/null 2>&1; then
+            for happy_scheme in https http; do
+                curl_out=$(curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --happy-eyeballs-timeout-ms 200 --write-out '%{remote_ip}' "${happy_scheme}://${input_target}" 2>/dev/null | tr -d '\r')
+                if [[ "$curl_out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$curl_out" == *:* ]]; then
+                    happy_ip="$curl_out"
+                    break
+                fi
+            done
+            if [ -n "$happy_ip" ]; then
+                target="$happy_ip"
+                resolved_target="$happy_ip"
+                if [[ "$happy_ip" == *:* ]]; then
+                    happy_family="IPv6"
+                else
+                    happy_family="IPv4"
+                fi
+                log_ok "Happy Eyeballs winner: ${happy_family} ${happy_ip} (${happy_scheme^^})"
+            else
+                log_err "Happy Eyeballs probe returned no winner; falling back to route-based selection."
+            fi
+        else
+            log_err "curl not found; skipping Happy Eyeballs probe."
+        fi
+
+        for ip_candidate in "${resolved_v4[@]}"; do
+            v4_route_line=$(ip -4 route get "$ip_candidate" 2>/dev/null | head -n 1)
+            if [ -n "$v4_route_line" ]; then
+                v4_routable="$ip_candidate"
+                v4_route_dev=$(echo "$v4_route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+                break
+            fi
+        done
+        for ip_candidate in "${resolved_v6[@]}"; do
+            v6_route_line=$(ip -6 route get "$ip_candidate" 2>/dev/null | head -n 1)
+            if [ -n "$v6_route_line" ]; then
+                v6_routable="$ip_candidate"
+                v6_route_dev=$(echo "$v6_route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+                break
+            fi
+        done
+        diag_intf="$trace_intf"
+        if [ -z "$diag_intf" ]; then
+            if [[ "$happy_ip" == *:* ]] && [ -n "$v6_route_dev" ]; then
+                diag_intf="$v6_route_dev"
+            elif [[ "$happy_ip" != *:* ]] && [ -n "$v4_route_dev" ]; then
+                diag_intf="$v4_route_dev"
+            elif [ -n "$v4_route_dev" ]; then
+                diag_intf="$v4_route_dev"
+            elif [ -n "$v6_route_dev" ]; then
+                diag_intf="$v6_route_dev"
+            fi
+        fi
+        if [ -n "$diag_intf" ]; then
+            diag_v4_addr=$(ip -4 addr show dev "$diag_intf" 2>/dev/null | awk '/inet / {print $2; exit}')
+            diag_v6_addr=$(ip -6 addr show dev "$diag_intf" scope global 2>/dev/null | awk '/inet6 / {print $2; exit}')
+            diag_v4_default=$(ip -4 route show default dev "$diag_intf" 2>/dev/null | head -n 1)
+            diag_v6_default=$(ip -6 route show default dev "$diag_intf" 2>/dev/null | head -n 1)
+        fi
+        if [ -n "$happy_ip" ]; then
+            if [[ "$happy_ip" == *:* ]] && [ -z "$v4_routable" ] && [ -n "$v6_routable" ]; then
+                if [ -n "$diag_intf" ] && [ -z "$diag_v4_addr" ] && [ -z "$diag_v4_default" ]; then
+                    happy_reason="IPv4 candidates were not routable on ${diag_intf}: no IPv4 address and no IPv4 default route. IPv6 route used ${v6_route_dev:-$diag_intf}."
+                elif [ -n "$diag_intf" ] && [ -z "$diag_v4_default" ]; then
+                    happy_reason="IPv4 candidates were not routable on ${diag_intf}: no IPv4 default route. IPv6 route used ${v6_route_dev:-$diag_intf}."
+                else
+                    happy_reason="IPv4 candidates were not routable; IPv6 was the only viable family (via ${v6_route_dev:-unknown})."
+                fi
+            elif [[ "$happy_ip" != *:* ]] && [ -z "$v6_routable" ] && [ -n "$v4_routable" ]; then
+                if [ -n "$diag_intf" ] && [ -z "$diag_v6_addr" ] && [ -z "$diag_v6_default" ]; then
+                    happy_reason="IPv6 candidates were not routable on ${diag_intf}: no global IPv6 address and no IPv6 default route. IPv4 route used ${v4_route_dev:-$diag_intf}."
+                elif [ -n "$diag_intf" ] && [ -z "$diag_v6_default" ]; then
+                    happy_reason="IPv6 candidates were not routable on ${diag_intf}: no IPv6 default route. IPv4 route used ${v4_route_dev:-$diag_intf}."
+                elif [ -n "$diag_intf" ] && [ -z "$diag_v6_addr" ]; then
+                    happy_reason="IPv6 candidates were not routable on ${diag_intf}: interface has no global IPv6 address. IPv4 route used ${v4_route_dev:-$diag_intf}."
+                else
+                    happy_reason="IPv6 candidates were not routable; IPv4 was the only viable family (via ${v4_route_dev:-unknown})."
+                fi
+            elif [[ "$happy_ip" == *:* ]] && [ -n "$v4_routable" ] && [ -n "$v6_routable" ]; then
+                happy_reason="Both IPv4 and IPv6 were routable (IPv4 via ${v4_route_dev:-unknown}, IPv6 via ${v6_route_dev:-unknown}); IPv6 completed first in the Happy Eyeballs race."
+            elif [[ "$happy_ip" != *:* ]] && [ -n "$v4_routable" ] && [ -n "$v6_routable" ]; then
+                happy_reason="Both IPv4 and IPv6 were routable (IPv4 via ${v4_route_dev:-unknown}, IPv6 via ${v6_route_dev:-unknown}); IPv4 completed first in the Happy Eyeballs race."
+            elif [[ "$happy_ip" == *:* ]]; then
+                happy_reason="IPv6 endpoint was selected by Happy Eyeballs (via ${v6_route_dev:-unknown})."
+            else
+                happy_reason="IPv4 endpoint was selected by Happy Eyeballs (via ${v4_route_dev:-unknown})."
+            fi
+            log_ok "Winner reason: ${happy_reason}"
+        fi
+
+        if [ -z "$resolved_target" ]; then
+            for ip_candidate in "${resolved_ips[@]}"; do
+                if [[ "$ip_candidate" == *:* ]]; then
+                    route_line=$(ip -6 route get "$ip_candidate" 2>/dev/null | head -n 1)
+                else
+                    route_line=$(ip -4 route get "$ip_candidate" 2>/dev/null | head -n 1)
+                fi
+                if [ -n "$route_line" ]; then
+                    target="$ip_candidate"
+                    resolved_target="$ip_candidate"
+                    break
+                fi
+            done
+        fi
+        if [ -z "$resolved_target" ]; then
+            target="${resolved_ips[0]}"
+            resolved_target="$target"
+        fi
+    fi
+
+    if [[ "$target" == *:* ]]; then
+        mtr_family_args=(-6)
+        route_line=$(ip -6 route get "$target" 2>/dev/null | head -n 1)
+    else
+        mtr_family_args=(-4)
+        route_line=$(ip -4 route get "$target" 2>/dev/null | head -n 1)
+    fi
+
+    if [ -n "$route_line" ]; then
+        route_dev=$(echo "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+        route_via=$(echo "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')
+        route_src=$(echo "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    fi
+    if [ -z "$trace_intf" ] && [ -n "$route_dev" ]; then
+        trace_intf="$route_dev"
+    fi
+    if [ -n "$trace_intf" ]; then
+        mtr_intf_args=(-I "$trace_intf")
     fi
 
     echo ""
     if [ "$input_target" != "$target" ]; then
-        echo "Tracing path to $input_target ($target)..."
+        if [ -n "$trace_intf" ]; then
+            echo "Tracing path to $input_target ($target) via $trace_intf..."
+        else
+            echo "Tracing path to $input_target ($target)..."
+        fi
     else
-        echo "Tracing path to $target..."
+        if [ -n "$trace_intf" ]; then
+            echo "Tracing path to $target via $trace_intf..."
+        else
+            echo "Tracing path to $target..."
+        fi
+    fi
+    if [ -n "$route_line" ]; then
+        log_ok "Route for ${target}: dev ${route_dev:-unknown} via ${route_via:-link} src ${route_src:-unknown}"
+    else
+        log_err "Could not determine route details for ${target}; using system defaults."
     fi
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
 
     (
         printf "Hop IP_Address Latency Netname ASN Location\n"
-        mtr -r -c 3 -n "$target" | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
+        mtr -r -c 3 -n "${mtr_family_args[@]}" "${mtr_intf_args[@]}" "$target" | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
             if [[ $ip =~ ^[0-9] ]] && [[ $ip != "???" ]]; then
                 ((hop++))
                 get_hop_info "$ip" "$latency" "$hop"
@@ -1153,10 +1894,10 @@ show_help() {
     echo "  interfaces          - List all local network interfaces and their details."
     echo "  scan [intf] [target] [--ports] [--resolve-hostnames] - Host discovery scan; optional port scan and Avahi hostname resolution."
     echo "  ports               - Show active listening ports (TCP/UDP)."
-    echo "  listen [intf] [managed|monitor] [bssid] [--channel n] [--bssid mac] - Listener; managed default, monitor optional."
+    echo "  listen [intf] [managed|monitor] [--channel n] [--bssid mac] [--dedupe] - Listener; managed default, monitor optional."
     echo "  bssid-scan [intf] [seconds] - Discover BSSID, SSID, channel, and signal in managed mode."
     echo "  fingerprint <ip> [--fast] - Run aggressive fingerprint scan; --fast scans top 100 ports."
-    echo "  traceroute [target] - Deep traceroute with Edge Node identification."
+    echo "  traceroute [intf] [target] - Deep traceroute with Edge Node identification."
     echo "  exit                - Exit the netmgr tool."
     echo "  help                - Show this help message."
 }

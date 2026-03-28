@@ -1,6 +1,6 @@
 # netmgr
 
-Interactive network management and discovery CLI written as a single Bash script.
+Single-file Bash network toolkit with interactive shell support (`NETMGR>`).
 
 ## Project Structure
 ```text
@@ -9,258 +9,223 @@ Interactive network management and discovery CLI written as a single Bash script
 └── README.md   # Documentation
 ```
 
-## What `netmgr` Does
+## Commands
 
-`netmgr` supports both single-command mode and an interactive shell (`NETMGR>` prompt).
+`netmgr` supports direct command mode and interactive mode.
 
 Implemented commands:
 - `interfaces`
 - `scan [intf] [target] [--ports] [--resolve-hostnames]`
 - `ports`
-- `listen [intf] [managed|monitor] [bssid] [--channel n] [--bssid mac]`
+- `listen [intf] [managed|monitor] [--channel n] [--bssid mac] [--dedupe]`
 - `bssid-scan [intf] [seconds]`
 - `fingerprint <ip> [--fast]`
-- `traceroute [target]`
+- `traceroute [intf] [target]`
 - `help`
 - `exit` / `quit`
 
 ## Dependencies
 
-Required for core features:
-- `bash`
-- `sudo`
-- `iproute2` (`ip`)
-- `jq`
-- `awk`, `sed`, `grep`, `sort`, `column`, `xargs`, `timeout`
-- `curl`
-- `nmap`
-- `ss`
-- `nmcli`
-- `iw`
-- `tcpdump`
-- `tshark`
-- `mtr`
-- `whois`
-- `dig` (from `dnsutils`)
+Core tools used by the script:
+- `bash`, `sudo`
+- `ip`, `jq`, `awk`, `sed`, `grep`, `sort`, `column`, `xargs`, `timeout`
+- `curl`, `nmap`, `ss`, `nmcli`, `tcpdump`, `tshark`, `mtr`, `whois`, `dig`
 
-Optional/conditional:
-- `avahi-resolve` (only used when `scan --resolve-hostnames` is set)
-- `/usr/share/nmap/nmap-mac-prefixes` (preferred local vendor DB source)
+Optional/fallback:
+- `avahi-resolve` (used by `scan --resolve-hostnames`)
+- `iw` (used by `interfaces` and monitor mode)
+- `/usr/share/nmap/nmap-mac-prefixes` (local MAC vendor DB)
 
-## Data Files
+## Data Files and Environment
 
-### MAC/IP Mapping Cache
-- Default path: `~/.local/share/netmgr/mac_ip_map.tsv`
-- Override with: `NETMGR_MAC_IP_DB`
+### MAC/IP cache
+- Path: `~/.local/share/netmgr/mac_ip_map.tsv`
+- Override: `NETMGR_MAC_IP_DB`
 - Format: `mac<TAB>ip` (lowercase MAC)
 
-How it is maintained:
-- Every `scan` run updates this file.
-- If a MAC is new: add a new row.
-- If a MAC exists: update the stored IP to the latest observed value.
+Behavior:
+- `scan` continuously upserts this file while streaming discoveries.
+- `listen` uses this file to fill `IP_Address` where available.
 
-Where it is used:
-- `listen` (managed + monitor) reads IPs from this file for the `IP` column.
+### MAC vendor DB
+- Default local DB: `/usr/share/nmap/nmap-mac-prefixes`
+- Override: `NETMGR_MAC_PREFIX_DB`
+- Fallback when local prefix miss: `https://api.macvendors.com/<mac>`
 
-### Vendor Prefix Database
-- Default path: `/usr/share/nmap/nmap-mac-prefixes`
-- Override with: `NETMGR_MAC_PREFIX_DB`
-- Fallback: `https://api.macvendors.com/<mac>` when local DB has no match.
+### Other env knobs
+- `NETMGR_SCAN_NMAP_DELAY` (seconds between nmap loops, default `2`)
+- `AVAHI_JOBS` (parallelism for hostname resolve, default `16`)
+- `NETMGR_AIRMON_KILL=1` (optional `airmon-ng check kill` pre-step in monitor mode)
 
-## Command Behavior
+## Command Details
 
 ### `interfaces`
-Shows a table with:
-- Interface
-- Status
-- IPv4/CIDR
-- MAC
-- MTU
-- DHCP (Yes/No/N/A)
-- Gateway
+Prints a table:
+- `Interface`, `Status`, `IP_Address`, `MAC_Address`, `MTU`, `DHCP`, `Gateway`
+
+Then appends raw diagnostics:
+- `sudo iw dev` (with path fallback for `iw`)
+- `lspci -knn | grep -iA2 net`
+- `ip route show`
+- `ip addr`
 
 ### `scan [intf] [target] [--ports] [--resolve-hostnames]`
-Host discovery and optional enrichment.
+Continuous streaming discovery using nmap + tshark in parallel.
 
-Input behavior:
-- `intf` optional.
-- `target` optional (CIDR/IP range).
-- If no interface is provided and a target is provided, route lookup chooses the best interface for that target.
-- If neither is provided, first active interface is selected.
+Interface/target resolution:
+- If `intf` omitted and `target` provided, route lookup picks the interface for that target.
+- If both omitted, first UP interface is selected.
+- Target defaults to interface subnet.
 
-Primary discovery command:
+Primary streaming loop:
 ```bash
-sudo nmap -sn -PS22,80,443 -PA21,23,3389 -PU40125 --max-retries 5 --stats-every 10s -e <interface> <target>
+sudo nmap -sn -PS22,80,443 -PA21,23,3389 -PU40125 --max-retries 5 --stats-every 10s -e <intf> <target>
 ```
 
-Optional port enrichment (`--ports`):
-1. Collect discovered host IPs.
+Parallel packet stream:
+- Runs `tshark` on the same interface.
+- Parses both `src` and `dst` IPv4/MAC pairs.
+- Dedupes streamed lines by MAC for console output.
+- Ignores unknown MAC, broadcast, and multicast MAC rows.
+
+Live output columns:
+- `Time`, `SRC` (`NMAP` or `TSHARK`), `IP_Address`, `MAC_Address`, `Hostname`, `Vendor`
+
+Optional `--ports`:
+1. Collect discovered IPs
 2. Run:
 ```bash
 sudo nmap -Pn --top-ports 200 -sS -n --min-parallelism 64 -iL - -oG -
 ```
-3. Parse open ports into `Ports` column.
+3. Parse open ports into final `Ports` column
 
-Optional hostname enrichment (`--resolve-hostnames`):
-- Runs `avahi-resolve -a <ip>` with `300ms` timeout in parallel.
-- Concurrency controlled by `AVAHI_JOBS` (default `16`).
+Optional `--resolve-hostnames`:
+- Uses `avahi-resolve -a <ip>` with `timeout 0.3s` in parallel.
 
-Output columns:
-- `IP_Address`
-- `Hostname/Identity`
-- `MAC_Address`
-- `Manufacturer`
-- `Ports`
-
-Pipeline order:
-1. Nmap host discovery
-2. Parse report into rows
-3. Optional top-ports scan merge
-4. MAC→IP DB upsert
-5. Optional Avahi hostname resolution
-6. Final table output
+End of run:
+- Press `Ctrl+C` to stop streaming loops.
+- Prints final table:
+  - `IP_Address`, `Hostname/Identity`, `MAC_Address`, `Manufacturer`, `Ports`
 
 ### `ports`
 Runs:
 ```bash
-sudo ss -tulpn | column -t
+sudo ss -tuanp | sort -k 1,1
 ```
 
+### `listen [intf] [managed|monitor] [--channel n] [--bssid mac] [--dedupe]`
+Default interface: `wlp8s0`
+Default mode: `managed`
+
+`--dedupe` behavior:
+- With `--dedupe`: one output line per MAC
+- Without `--dedupe`: prints all parsed traffic rows
+
+#### Managed mode
+- Captures all traffic on the interface.
+- Uses `tshark` when available for full protocol stack decoding.
+- Falls back to `tcpdump` basic parser if `tshark` is unavailable.
+
+Output (non-dedupe):
+- `Time`, `MAC_Address`, `IP_Address`, `Vendor`, `Protocol_Stack`
+
+Notes:
+- On Wi-Fi interfaces named `wlp*`, `Ethernet` in the stack is relabeled to `Synthetic Eth`.
+- Vendor output is truncated to 31 chars for table alignment.
+- Uses `[OK]`/`[ERR]` status labels.
+
+#### Monitor mode
+- Requires sudo-capable flow.
+- Builds/uses monitor interface `mon0`.
+- Cleans stale monitor and dummy hotspot resources (`mon0`, `Netmgr_Awake`, `netmgr_dummy`) before start.
+- Optional `--bssid` filter and `--channel` lock.
+- If `--bssid` is supplied without channel, attempts to discover the channel via `nmcli` then `iw` scan fallback.
+- If no fixed channel can be resolved, enables channel hopping.
+
+MediaTek wake-up path (when channel is known):
+- Creates temporary hotspot with `nmcli` to wake/lock radio state.
+- Keeps capture on `mon0`.
+
+Monitor output columns:
+- `Time`, `BSSID`, `SSID`, `CH`, `MAC_Address`, `IP_Address`, `Vendor`, `Protocol`
+
+Decryption attempt:
+- Reads saved Wi-Fi credentials from NetworkManager and passes WPA key to tshark decode options when available.
+- If not available, logs warning and protocol may remain `802.11`.
+
+Exit behavior:
+- `Ctrl+C` triggers cleanup, deletes monitor/hotspot resources, and attempts reconnect to previous Wi-Fi connection.
+
 ### `bssid-scan [intf] [seconds]`
-Managed-mode Wi-Fi scan summary via `nmcli`.
+Managed-mode Wi-Fi survey using `nmcli`.
 
 Defaults:
 - Interface: `wlp8s0`
 - Duration: `12` seconds
 
 Output columns:
-- `BSSID`
-- `SSID`
-- `Channel`
-- `Band` (`2.4GHz` or `5GHz`)
-- `Signal_pct`
-- `Seen` (number of observations during scan window)
-
-### `listen [intf] [managed|monitor] [bssid] [--channel n] [--bssid mac]`
-Live listener with two modes.
-
-Defaults:
-- Interface: `wlp8s0`
-- Mode: `managed`
-
-#### Managed mode
-Captures local ARP and IoT-related UDP broadcast traffic:
-- DHCP (67)
-- SSDP (1900)
-- WS-Discovery (3702)
-- mDNS (5353)
-- UniFi (10001)
-- Sonos (15600)
-- LIFX (56700)
-- Spotify Connect (57621)
-
-Prints unique MACs seen:
-- Time
-- MAC
-- IP (from MAC/IP DB)
-- Vendor
-
-#### Monitor mode
-Monitor pipeline:
-1. Validate/normalize BSSID args (if provided)
-2. Resolve channel from `--channel`, BSSID lookup, current Wi-Fi channel, or fall back to hopping
-3. Preflight cleanup of stale `mon0` and hotspot profiles (`Netmgr_Awake`/`netmgr_dummy`)
-4. Create `mon0` monitor interface on the interface PHY
-5. Disconnect managed interface
-6. Optional MediaTek wakeup sequence via temporary hotspot lock on target channel
-7. Optional channel hopping if no fixed channel resolved
-8. Capture frames with `tshark` and print unique MACs per `BSSID|MAC`
-9. On exit, cleanup and reconnect managed Wi-Fi
-
-Monitor output columns:
-- Time
-- BSSID
-- SSID
-- CH
-- MAC
-- IP (from MAC/IP DB)
-- Vendor
-
-Notes:
-- IPs in `listen` are cache-based (from `scan` DB), not decrypted from monitor traffic.
-- Ctrl+C triggers cleanup and reconnection logic.
-
-Environment flags affecting listen:
-- `NETMGR_AIRMON_KILL=1` enables `airmon-ng check kill` pre-step.
+- `BSSID`, `SSID`, `Channel`, `Band` (`2.4GHz`/`5GHz`), `Signal_pct`, `Seen`
 
 ### `fingerprint <ip> [--fast]`
-Aggressive service fingerprinting.
-
-Default:
+Host fingerprinting:
+- Default:
 ```bash
 sudo nmap -A -p- -T4 <ip>
 ```
-
-Fast mode:
+- Fast mode:
 ```bash
 sudo nmap -A --top-ports 100 -T4 <ip>
 ```
 
-### `traceroute [target]`
-Deep path inspection.
+### `traceroute [intf] [target]`
+Deep traceroute with enrichment.
+
+Defaults:
+- Target: `8.8.8.8`
+- Interface: auto-selected from route if not provided
 
 Behavior:
-- Default target: `8.8.8.8`
-- If hostname is passed, resolve to IP first (`getent`)
-- Runs `mtr -r -c 3 -n`
-- Enriches hops with ASN/netname/location using `ipinfo.io` + Team Cymru whois
-- If target is `8.8.8.8`, attempts Google edge-node identification via DNS TXT query
+- Accepts IPv4, IPv6, or hostname targets.
+- For hostnames, performs a Happy Eyeballs probe with:
+```bash
+curl --happy-eyeballs-timeout-ms 200
+```
+- Prints:
+  - AAAA candidates
+  - A candidates
+  - winner family/IP
+  - winner reason (including interface route/address constraints when relevant)
+- Uses family-specific route lookup (`ip -4/-6 route get ...`)
+- Runs `mtr -r -c 3 -n` with selected family and interface.
+- Enriches hops with ASN/netname/location via `ipinfo.io` + Team Cymru whois.
 
 Output columns:
-- `Hop`
-- `IP_Address` (with local/private prefix handling)
-- `Latency`
-- `Netname`
-- `ASN`
-- `Location`
+- `Hop`, `IP_Address`, `Latency`, `Netname`, `ASN`, `Location`
 
 ## Usage
 
-### Single Command Mode
+### Direct mode
 ```bash
 ./netmgr interfaces
 ./netmgr scan wlp8s0 192.168.1.0/24
-./netmgr scan wlp8s0 192.168.1.0/24 --ports
-./netmgr scan 192.168.1.0/24 --resolve-hostnames
+./netmgr scan wlp8s0 192.168.1.0/24 --ports --resolve-hostnames
 ./netmgr listen wlp8s0 managed
+./netmgr listen wlp8s0 managed --dedupe
 ./netmgr listen wlp8s0 monitor --bssid D4:86:60:6B:80:89 --channel 6
 ./netmgr bssid-scan wlp8s0 15
 ./netmgr fingerprint 192.168.1.254 --fast
-./netmgr traceroute www.google.com
+./netmgr traceroute wlp8s0 www.google.com
 ```
 
-### Interactive Mode
+### Interactive mode
 ```bash
 ./netmgr
 NETMGR> interfaces
 NETMGR> scan wlp8s0 192.168.1.0/24 --ports
-NETMGR> listen monitor --channel 6
+NETMGR> listen wlp8s0 monitor --bssid D4:86:60:6B:80:89 --channel 6
+NETMGR> traceroute enp9s0 www.google.com
 NETMGR> exit
 ```
 
-## Inputs and Outputs Summary
-
-Inputs:
-- CLI args/flags per command
-- Local system interfaces/routes
-- Local Wi-Fi scan state via `nmcli`
-- Packet capture via `tcpdump`/`tshark`
-- External metadata APIs for vendor/trace enrichment
-
-Outputs:
-- Tabular terminal reports
-- Live event lines for `listen`
-- Persistent MAC/IP mapping file at `~/.local/share/netmgr/mac_ip_map.tsv`
-
 ## Author
-Created by Terrydaktal.
+Terrydaktal
