@@ -32,7 +32,6 @@ Core tools used by the script:
 - `curl`, `nmap`, `ss`, `nmcli`, `tcpdump`, `tshark`, `mtr`, `whois`, `dig`
 
 Optional/fallback:
-- `avahi-resolve` (used by `scan --resolve-hostnames`)
 - `iw` (used by `interfaces` and monitor mode)
 - `/usr/share/nmap/nmap-mac-prefixes` (local MAC vendor DB)
 
@@ -54,8 +53,9 @@ Behavior:
 
 ### Other env knobs
 - `NETMGR_SCAN_NMAP_DELAY` (seconds between nmap loops, default `2`)
-- `AVAHI_JOBS` (parallelism for hostname resolve, default `16`)
+- `AVAHI_JOBS` (parallelism for `scan --resolve-hostnames`, default `16`)
 - `NETMGR_AIRMON_KILL=1` (optional `airmon-ng check kill` pre-step in monitor mode)
+- `NETMGR_TRACE_DISCOVERY_ROUNDS` (traceroute hop-discovery rounds, default `3`)
 
 ## Command Details
 
@@ -67,7 +67,8 @@ Then appends raw diagnostics:
 - `sudo iw dev` (with path fallback for `iw`)
 - `lspci -knn | grep -iA2 net`
 - `ip route show`
-- `ip addr`
+- `sudo ethtool <detected ethernet interfaces>`
+- `ip -s addr`
 
 ### `scan [intf] [target] [--ports] [--resolve-hostnames]`
 Continuous streaming discovery using nmap + tshark in parallel.
@@ -100,7 +101,7 @@ sudo nmap -Pn --top-ports 200 -sS -n --min-parallelism 64 -iL - -oG -
 3. Parse open ports into final `Ports` column
 
 Optional `--resolve-hostnames`:
-- Uses `avahi-resolve -a <ip>` with `timeout 0.3s` in parallel.
+- Uses `getent hosts <ip>` with `timeout 0.3s` in parallel.
 
 End of run:
 - Press `Ctrl+C` to stop streaming loops.
@@ -164,7 +165,7 @@ Defaults:
 - Duration: `12` seconds
 
 Output columns:
-- `BSSID`, `SSID`, `Channel`, `Band` (`2.4GHz`/`5GHz`), `Signal_pct`, `Seen`
+- `BSSID`, `SSID`, `Channel`, `Freq_MHz`, `Band` (`2.4GHz`/`5GHz`/`6GHz`), `Signal_pct`, `Seen`
 
 ### `fingerprint <ip> [--fast]`
 Host fingerprinting:
@@ -196,11 +197,11 @@ curl --happy-eyeballs-timeout-ms 200
   - winner family/IP
   - winner reason (including interface route/address constraints when relevant)
 - Uses family-specific route lookup (`ip -4/-6 route get ...`)
-- Runs `mtr -r -c 3 -n` with selected family and interface.
+- Discovers hops by running `traceroute` in three modes (`UDP`, `ICMP`, `TCP:443`) across multiple rounds, writes merged hop list to `/tmp/route-hops.txt`, then pings each hop 20 times.
 - Enriches hops with ASN/netname/location via `ipinfo.io` + Team Cymru whois.
 
 Output columns:
-- `Hop`, `IP_Address`, `Latency`, `Netname`, `ASN`, `Location`
+- `Hop`, `IP_Address`, `Loss`, `Avg`, `Lowest`, `Netname`, `ASN`, `Location`
 
 ## Usage
 

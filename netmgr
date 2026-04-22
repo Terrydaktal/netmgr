@@ -319,6 +319,9 @@ ensure_sudo_session() {
 
 show_interfaces() {
     local iw_cmd=""
+    local ethtool_cmd=""
+    local -a ethernet_ifaces=()
+    local ifname=""
 
     if command -v iw >/dev/null 2>&1; then
         iw_cmd=$(command -v iw)
@@ -331,7 +334,11 @@ show_interfaces() {
     elif [ -x /bin/iw ]; then
         iw_cmd="/bin/iw"
     fi
-    if [ -n "$iw_cmd" ] && [ "$EUID" -ne 0 ]; then
+    if command -v ethtool >/dev/null 2>&1; then
+        ethtool_cmd=$(command -v ethtool)
+    fi
+    mapfile -t ethernet_ifaces < <(ip -j link show | jq -r '.[].ifname' | grep -E '^(en|eth)' || true)
+    if [ "$EUID" -ne 0 ] && { [ -n "$iw_cmd" ] || [ -n "$ethtool_cmd" ]; }; then
         ensure_sudo_session || return 1
     fi
 
@@ -402,9 +409,29 @@ show_interfaces() {
     ip route show
     echo "----------------------------------------------------------------------------------------------------------------"
     echo ""
-    echo "ip addr"
+    echo "sudo ethtool <ethernet interfaces>"
     echo "----------------------------------------------------------------------------------------------------------------"
-    ip addr
+    if [ -n "$ethtool_cmd" ]; then
+        if [ "${#ethernet_ifaces[@]}" -eq 0 ]; then
+            echo "No ethernet interfaces detected."
+        else
+            for ifname in "${ethernet_ifaces[@]}"; do
+                echo "-- $ifname --"
+                if [ "$EUID" -eq 0 ]; then
+                    "$ethtool_cmd" "$ifname"
+                else
+                    sudo "$ethtool_cmd" "$ifname"
+                fi
+            done
+        fi
+    else
+        echo "ethtool: command not found"
+    fi
+    echo "----------------------------------------------------------------------------------------------------------------"
+    echo ""
+    echo "ip -s addr"
+    echo "----------------------------------------------------------------------------------------------------------------"
+    ip -s addr
     echo "----------------------------------------------------------------------------------------------------------------"
     echo ""
 }
@@ -436,6 +463,7 @@ scan_subnet() {
     local tshark_pid=""
     local consumer_pid=""
     declare -A VENDOR_CACHE
+    declare -A HOSTNAME_CACHE
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -496,7 +524,6 @@ scan_subnet() {
     fi
 
     ensure_sudo_session || return 1
-
     echo ""
     echo "Using Interface: $INTF ($MY_IP)"
     echo "Scanning Subnet: $TARGET..."
@@ -567,6 +594,33 @@ scan_subnet() {
         mv "$row_tmp" "$tmp_rows"
     }
 
+    resolve_scan_hostname() {
+        local ip="$1"
+        local resolved=""
+
+        if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "unknown"
+            return
+        fi
+
+        if [ -n "${HOSTNAME_CACHE[$ip]+x}" ]; then
+            echo "${HOSTNAME_CACHE[$ip]}"
+            return
+        fi
+
+        if [ "$ip" = "$MY_IP" ]; then
+            resolved=$(hostname -s 2>/dev/null | head -n 1)
+        fi
+
+        if [ -z "$resolved" ]; then
+            resolved=$(timeout 0.3s getent hosts "$ip" 2>/dev/null | awk 'NR==1 {print $2}')
+        fi
+
+        [ -z "$resolved" ] && resolved="unknown"
+        HOSTNAME_CACHE["$ip"]="$resolved"
+        echo "$resolved"
+    }
+
     cleanup_scan_stream() {
         if [ -n "$nmap_pid" ]; then
             kill -TERM "$nmap_pid" >/dev/null 2>&1 || true
@@ -609,6 +663,7 @@ scan_subnet() {
         declare -A streamed_macs
         while IFS=$'\t' read -r src ip host mac vendor rest; do
             local first_octet=""
+            local local_mac=""
             [ -n "$rest" ] && continue
             if [ "$src" != "NMAP" ] && [ "$src" != "TSHARK" ]; then
                 continue
@@ -632,6 +687,9 @@ scan_subnet() {
             fi
 
             if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                if [ "$host" = "unknown" ]; then
+                    host=$(resolve_scan_hostname "$ip")
+                fi
                 upsert_scan_row "$ip" "$host" "$local_mac" "$vendor" "n/a"
                 upsert_mac_ip_db_pair "$ip" "$local_mac"
                 if [ -z "${streamed_macs[$local_mac]+x}" ]; then
@@ -802,7 +860,7 @@ scan_subnet() {
         tr '\n' '\0' < "$tmp_rows" | xargs -r -0 -n 1 -P "$AVAHI_JOBS" bash -c '
             line="$1"
             IFS=$'\''\t'\'' read -r ip disp_h mac vendor p_list <<< "$line"
-            resolved_host=$(timeout 0.3s avahi-resolve -a "$ip" 2>/dev/null | awk '\''NR==1 {print $2}'\'')
+            resolved_host=$(timeout 0.3s getent hosts "$ip" 2>/dev/null | awk '\''NR==1 {print $2}'\'')
             if [ -n "$resolved_host" ]; then
                 disp_h="$resolved_host"
             fi
@@ -862,7 +920,7 @@ bssid_scan() {
 
     while [ "$SECONDS" -lt "$end_ts" ]; do
         nmcli dev wifi rescan ifname "$INTERFACE" >/dev/null 2>&1 || true
-        nmcli -e no -t -f BSSID,CHAN,SIGNAL,SSID dev wifi list ifname "$INTERFACE" 2>/dev/null >> "$tmp_rows"
+        nmcli -e no -t -f BSSID,CHAN,FREQ,SIGNAL,SSID dev wifi list ifname "$INTERFACE" 2>/dev/null >> "$tmp_rows"
         sleep 2
     done
 
@@ -880,11 +938,14 @@ bssid_scan() {
             }
             return out
         }
-        function band_for_channel(c) {
-            if (c ~ /^[0-9]+$/) {
-                if ((c + 0) >= 1 && (c + 0) <= 14) return "2.4GHz"
-                return "5GHz"
+        function band_for_freq(f, c) {
+            if (f ~ /^[0-9]+$/) {
+                if ((f + 0) >= 2400 && (f + 0) < 2500) return "2.4GHz"
+                if ((f + 0) >= 4900 && (f + 0) < 5950) return "5GHz"
+                if ((f + 0) >= 5950 && (f + 0) <= 7125) return "6GHz"
             }
+            if (c ~ /^[0-9]+$/ && (c + 0) >= 1 && (c + 0) <= 14) return "2.4GHz"
+            if (c ~ /^[0-9]+$/) return "5GHz"
             return "?"
         }
         {
@@ -892,11 +953,14 @@ bssid_scan() {
             if (b == "") next
 
             c = $7
-            sig_raw = $8
+            f = $8
+            fnum = f
+            gsub(/[^0-9]/, "", fnum)
+            sig_raw = $9
             s = ""
-            if (NF >= 9) {
-                s = $9
-                for (i = 10; i <= NF; i++) s = s ":" $i
+            if (NF >= 10) {
+                s = $10
+                for (i = 11; i <= NF; i++) s = s ":" $i
             }
             if (s == "") s = "<hidden>"
             sig_ok = (sig_raw ~ /^[0-9]+$/)
@@ -907,11 +971,13 @@ bssid_scan() {
                 has_init[b] = 1
                 ssid[b] = s
                 chan[b] = (c == "" ? "?" : c)
+                freq[b] = (fnum == "" ? "?" : fnum)
                 has_sig[b] = sig_ok ? 1 : 0
                 best_sig[b] = sig
             } else {
                 if (ssid[b] == "<hidden>" && s != "<hidden>") ssid[b] = s
                 if (chan[b] == "?" && c != "") chan[b] = c
+                if ((freq[b] == "" || freq[b] == "?") && fnum != "") freq[b] = fnum
                 if (sig_ok && (!has_sig[b] || sig > best_sig[b])) {
                     has_sig[b] = 1
                     best_sig[b] = sig
@@ -922,15 +988,16 @@ bssid_scan() {
             for (b in seen) {
                 gsub(/ /, "_", ssid[b])
                 sig_disp = has_sig[b] ? best_sig[b] : "N/A"
-                band_disp = band_for_channel(chan[b])
-                printf "%s\t%s\t%s\t%s\t%s\t%d\n", toupper(b), ssid[b], chan[b], band_disp, sig_disp, seen[b]
+                band_disp = band_for_freq(freq[b], chan[b])
+                freq_disp = (freq[b] == "" ? "?" : freq[b])
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\n", toupper(b), ssid[b], chan[b], freq_disp, band_disp, sig_disp, seen[b]
             }
         }
     ' "$tmp_rows" | sort -V > "${tmp_rows}.out"
 
     echo "--------------------------------------------------------------------------------"
     (
-        printf "BSSID\tSSID\tChannel\tBand\tSignal_pct\tSeen\n"
+        printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tSignal_pct\tSeen\n"
         cat "${tmp_rows}.out"
     ) | column -t -s $'\t' | sed 's/_/ /g'
     echo "--------------------------------------------------------------------------------"
@@ -1615,11 +1682,24 @@ fingerprint_host() {
 
 get_hop_info() {
     local ip="$1"
-    local latency="$2"
-    local hop="$3"
+    local loss_rate="$2"
+    local avg_latency="$3"
+    local best_latency="$4"
+    local hop="$5"
     local suffix=""
+    local netname=""
+    local asn=""
+    local location=""
+    local asn_disp=""
+    local ip_data=""
+    local cymru_data=""
+    local raw_range=""
+    local city=""
+    local country=""
+    local postal=""
+    local org=""
     
-    if [[ $ip =~ ^192\.168\. ]] || [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+    if [[ $ip =~ ^192\.168\. ]] || [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || [[ $ip =~ ^fe80: ]] || [[ $ip =~ ^fd[0-9a-f]{2}: ]] || [[ $ip =~ ^fc[0-9a-f]{2}: ]]; then
         suffix=$(get_local_cidr "$ip")
         netname="Local_Network"
         asn="N/A"
@@ -1629,7 +1709,9 @@ get_hop_info() {
         cymru_data=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -n 1)
         
         raw_range=$(echo "$cymru_data" | awk -F'|' '{print $3}' | xargs)
-        suffix=$(range_to_suffix "$raw_range")
+        if [[ "$ip" != *:* ]]; then
+            suffix=$(range_to_suffix "$raw_range")
+        fi
         
         city=$(echo "$ip_data" | jq -r '.city // empty' | tr ' ' '_')
         country=$(echo "$ip_data" | jq -r '.country // empty')
@@ -1647,7 +1729,7 @@ get_hop_info() {
     if [ -z "$netname" ] || [[ "$netname" == "AS Name" ]]; then netname="unknown"; fi
     if [[ "$asn" == "AS" ]] || [[ "$asn" == "N/A" ]] || [ -z "$asn" ]; then asn_disp="N/A"; else asn_disp="$asn"; fi
 
-    printf "%s %s %s %s %s %s\n" "$hop" "$ip$suffix" "${latency}ms" "$netname" "$asn_disp" "$location"
+    printf "%s %s %s %s %s %s %s %s\n" "$hop" "$ip$suffix" "$loss_rate" "$avg_latency" "$best_latency" "$netname" "$asn_disp" "$location"
 }
 
 run_traceroute() {
@@ -1655,8 +1737,9 @@ run_traceroute() {
     local input_target="8.8.8.8"
     local target="$input_target"
     local resolved_target=""
-    local mtr_intf_args=()
-    local mtr_family_args=()
+    local trace_family="-4"
+    local -a trace_tool_intf_args=()
+    local -a ping_iface_args=()
     local hop=0
     local route_line=""
     local route_dev=""
@@ -1679,6 +1762,15 @@ run_traceroute() {
     local diag_v6_addr=""
     local diag_v4_default=""
     local diag_v6_default=""
+    local route_hops_file="/tmp/route-hops.txt"
+    local route_hops_raw=""
+    local discovery_rounds="${NETMGR_TRACE_DISCOVERY_ROUNDS:-3}"
+    local round=1
+    local hop_ip=""
+    local ping_out=""
+    local hop_loss=""
+    local hop_avg=""
+    local hop_best=""
     local -a resolved_ips=()
     local -a resolved_v4=()
     local -a resolved_v6=()
@@ -1827,10 +1919,10 @@ run_traceroute() {
     fi
 
     if [[ "$target" == *:* ]]; then
-        mtr_family_args=(-6)
+        trace_family="-6"
         route_line=$(ip -6 route get "$target" 2>/dev/null | head -n 1)
     else
-        mtr_family_args=(-4)
+        trace_family="-4"
         route_line=$(ip -4 route get "$target" 2>/dev/null | head -n 1)
     fi
 
@@ -1843,7 +1935,8 @@ run_traceroute() {
         trace_intf="$route_dev"
     fi
     if [ -n "$trace_intf" ]; then
-        mtr_intf_args=(-I "$trace_intf")
+        trace_tool_intf_args=(-i "$trace_intf")
+        ping_iface_args=(-I "$trace_intf")
     fi
 
     echo ""
@@ -1865,34 +1958,214 @@ run_traceroute() {
     else
         log_err "Could not determine route details for ${target}; using system defaults."
     fi
+    if ! command -v traceroute >/dev/null 2>&1; then
+        log_err "traceroute command not found."
+        return 1
+    fi
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
+    route_hops_raw=$(mktemp)
+    if ! [[ "$discovery_rounds" =~ ^[0-9]+$ ]] || [ "$discovery_rounds" -le 0 ]; then
+        discovery_rounds=3
+    fi
+
+    if [ "$trace_family" = "-4" ]; then
+        for ((round = 1; round <= discovery_rounds; round++)); do
+            traceroute -4 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="udp-r${round}" '
+                NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop = $1 + 0
+                    for (i = 2; i <= NF; i++) {
+                        tok = $i
+                        gsub(/[(),]/, "", tok)
+                        if (tok ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                            print s "\t" hop "\t" tok
+                        }
+                    }
+                }
+            ' >> "$route_hops_raw"
+            traceroute -4 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="icmp-r${round}" '
+                NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop = $1 + 0
+                    for (i = 2; i <= NF; i++) {
+                        tok = $i
+                        gsub(/[(),]/, "", tok)
+                        if (tok ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                            print s "\t" hop "\t" tok
+                        }
+                    }
+                }
+            ' >> "$route_hops_raw"
+            traceroute -4 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="tcp-r${round}" '
+                NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop = $1 + 0
+                    for (i = 2; i <= NF; i++) {
+                        tok = $i
+                        gsub(/[(),]/, "", tok)
+                        if (tok ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                            print s "\t" hop "\t" tok
+                        }
+                    }
+                }
+            ' >> "$route_hops_raw"
+        done
+    else
+        for ((round = 1; round <= discovery_rounds; round++)); do
+            traceroute -6 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="udp-r${round}" '
+                NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop = $1 + 0
+                    for (i = 2; i <= NF; i++) {
+                        tok = $i
+                        sub(/%.*/, "", tok)
+                        gsub(/[(),]/, "", tok)
+                        if (tok ~ /:/ && tok ~ /^[0-9A-Fa-f:]+$/) {
+                            print s "\t" hop "\t" tok
+                        }
+                    }
+                }
+            ' >> "$route_hops_raw"
+            traceroute -6 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="icmp-r${round}" '
+                NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop = $1 + 0
+                    for (i = 2; i <= NF; i++) {
+                        tok = $i
+                        sub(/%.*/, "", tok)
+                        gsub(/[(),]/, "", tok)
+                        if (tok ~ /:/ && tok ~ /^[0-9A-Fa-f:]+$/) {
+                            print s "\t" hop "\t" tok
+                        }
+                    }
+                }
+            ' >> "$route_hops_raw"
+            traceroute -6 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="tcp-r${round}" '
+                NR > 1 && $1 ~ /^[0-9]+$/ {
+                    hop = $1 + 0
+                    for (i = 2; i <= NF; i++) {
+                        tok = $i
+                        sub(/%.*/, "", tok)
+                        gsub(/[(),]/, "", tok)
+                        if (tok ~ /:/ && tok ~ /^[0-9A-Fa-f:]+$/) {
+                            print s "\t" hop "\t" tok
+                        }
+                    }
+                }
+            ' >> "$route_hops_raw"
+        done
+    fi
+
+    awk -F'\t' '
+        function list_has(list, item, arr, n, i) {
+            n = split(list, arr, " ")
+            for (i = 1; i <= n; i++) {
+                if (arr[i] == item) return 1
+            }
+            return 0
+        }
+        {
+            scan = $1
+            hop = $2 + 0
+            ip = $3
+            if (scan == "" || hop <= 0 || ip == "") next
+
+            ips[ip] = 1
+            scans[scan] = 1
+            if (!(ip in minhop) || hop < minhop[ip]) minhop[ip] = hop
+            sumhop[ip] += hop
+            cnt[ip]++
+
+            key = scan SUBSEP hop
+            if (!(key in hop_ips)) {
+                hop_ips[key] = ip
+            } else if (!list_has(hop_ips[key], ip)) {
+                hop_ips[key] = hop_ips[key] " " ip
+            }
+            if (!(scan in maxhop) || hop > maxhop[scan]) maxhop[scan] = hop
+        }
+        END {
+            for (s in scans) {
+                prev = ""
+                for (h = 1; h <= maxhop[s]; h++) {
+                    key = s SUBSEP h
+                    if (!(key in hop_ips)) continue
+                    curr = hop_ips[key]
+                    if (prev != "") {
+                        nprev = split(prev, p, " ")
+                        ncurr = split(curr, c, " ")
+                        for (i = 1; i <= nprev; i++) {
+                            for (j = 1; j <= ncurr; j++) {
+                                if (p[i] != c[j]) {
+                                    edge[p[i] SUBSEP c[j]] = 1
+                                }
+                            }
+                        }
+                    }
+                    prev = curr
+                }
+            }
+
+            nips = 0
+            for (ip in ips) {
+                score[ip] = sumhop[ip] / cnt[ip]
+                nips++
+            }
+
+            for (iter = 1; iter <= nips * 4; iter++) {
+                changed = 0
+                for (e in edge) {
+                    split(e, uv, SUBSEP)
+                    u = uv[1]
+                    v = uv[2]
+                    if (score[u] >= score[v]) {
+                        score[v] = score[u] + 0.01
+                        changed = 1
+                    }
+                }
+                if (!changed) break
+            }
+
+            for (ip in ips) {
+                printf "%.6f\t%d\t%s\n", score[ip], minhop[ip], ip
+            }
+        }
+    ' "$route_hops_raw" | sort -n -k1,1 -k2,2n -k3,3 | awk -F'\t' '{print $3}' > "$route_hops_file"
+
+    if ! grep -Fxq "$target" "$route_hops_file" 2>/dev/null; then
+        echo "$target" >> "$route_hops_file"
+    fi
+
+    if [ ! -s "$route_hops_file" ]; then
+        log_err "No hops discovered."
+        return 1
+    fi
+
+    log_ok "Discovered hop list written to ${route_hops_file}"
 
     (
-        printf "Hop IP_Address Latency Netname ASN Location\n"
-        mtr -r -c 3 -n "${mtr_family_args[@]}" "${mtr_intf_args[@]}" "$target" | awk 'NR>2 {print $2 "|" $6}' | while IFS="|" read -r ip latency; do
-            if [[ $ip =~ ^[0-9] ]] && [[ $ip != "???" ]]; then
-                ((hop++))
-                get_hop_info "$ip" "$latency" "$hop"
+        printf "Hop IP_Address Loss Avg Lowest Netname ASN Location\n"
+        while IFS= read -r hop_ip; do
+            [ -z "$hop_ip" ] && continue
+            ((hop++))
+            if [ "$trace_family" = "-4" ]; then
+                ping_out=$(ping -4 -n -q -c 20 -i 0.2 -W 1 "${ping_iface_args[@]}" "$hop_ip" 2>/dev/null)
+            else
+                ping_out=$(ping -6 -n -q -c 20 -i 0.2 -W 1 "${ping_iface_args[@]}" "$hop_ip" 2>/dev/null)
             fi
-        done
-
-        if [[ "$target" == "8.8.8.8" ]]; then
-            edge_ip=$(dig +short TXT o-o.myaddr.l.google.com @8.8.8.8 | tr -d '"' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
-            if [ -n "$edge_ip" ]; then
-                edge_latency=$(ping -c 1 -W 1 "$edge_ip" | grep "time=" | sed -E 's/.*time=([0-9.]+).*/\1/')
-                if [ -z "$edge_latency" ]; then edge_latency="N/A"; fi
-                get_hop_info "$edge_ip" "$edge_latency" "END"
-            fi
-        fi
+            hop_loss=$(echo "$ping_out" | awk -F', ' '/packets transmitted/ {for (i=1; i<=NF; i++) if ($i ~ /% packet loss/) {gsub(/% packet loss/, "", $i); print $i "%"; exit}}')
+            hop_avg=$(echo "$ping_out" | awk -F'=' '/^rtt |^round-trip/ {split($2, a, "/"); gsub(/[[:space:]]/, "", a[2]); print a[2] "ms"; exit}')
+            hop_best=$(echo "$ping_out" | awk -F'=' '/^rtt |^round-trip/ {split($2, a, "/"); gsub(/[[:space:]]/, "", a[1]); print a[1] "ms"; exit}')
+            [ -z "$hop_loss" ] && hop_loss="100%"
+            [ -z "$hop_avg" ] && hop_avg="N/A"
+            [ -z "$hop_best" ] && hop_best="N/A"
+            get_hop_info "$hop_ip" "$hop_loss" "$hop_avg" "$hop_best" "$hop"
+        done < "$route_hops_file"
     ) | column -t | sed 's/_/ /g'
     echo "-------------------------------------------------------------------------------------------------------------------------------------------------------"
     echo ""
+    rm -f "$route_hops_raw"
 }
 
 show_help() {
     echo "NETMGR Commands:"
     echo "  interfaces          - List all local network interfaces and their details."
-    echo "  scan [intf] [target] [--ports] [--resolve-hostnames] - Host discovery scan; optional port scan and Avahi hostname resolution."
+    echo "  scan [intf] [target] [--ports] [--resolve-hostnames] - Host discovery scan; optional port scan and getent hostname resolution."
     echo "  ports               - Show active listening ports (TCP/UDP)."
     echo "  listen [intf] [managed|monitor] [--channel n] [--bssid mac] [--dedupe] - Listener; managed default, monitor optional."
     echo "  bssid-scan [intf] [seconds] - Discover BSSID, SSID, channel, and signal in managed mode."
@@ -1911,7 +2184,7 @@ run_command() {
         bssid-scan) shift; bssid_scan "$@"; ;;
         fingerprint) shift; fingerprint_host "$@"; ;;
         traceroute) shift; run_traceroute "$@"; ;;
-        help) show_help; ;;
+        help|-h|--help) show_help; ;;
         exit|quit) exit 0; ;;
         "") ;;
         *) echo "Unknown command: $1"; ;;
