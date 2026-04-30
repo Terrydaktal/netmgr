@@ -893,16 +893,411 @@ show_ports() {
     sudo ss -tuanp | sort -k 1,1
 }
 
-bssid_scan() {
-    local INTERFACE="${1:-wlp8s0}"
-    local DURATION="${2:-12}"
-    local end_ts
-    local tmp_rows
+bssid_scan_realtime() {
+    local INTERFACE="$1"
+    local DURATION_ARG="$2"
+    local TARGET_CHAN="$3"
+    local DURATION=0
+    local finite_mode=0
+    local duration_label="forever"
+    local start_ms=0
+    local now_ms=0
+    local end_ms=0
+    local remaining_s=0
+    local HOTSPOT_CONN_NAME="Netmgr_Awake"
+    local HOTSPOT_PSK="hunter22"
+    local BAND=""
+    local PHY_NUM=""
+    local CAPTURE_IF="mon0"
+    local hotspot_err=""
+    local channel_hop_pid=""
+    local prev_conn_uuid=""
+    local reconnect_ok=0
+    local reconnect_conn=""
+    local device_state=""
+    local poll_i=0
+    local scan_interrupted=0
+    local monitor_cleanup_done=0
+    local found_stale=0
+    local dummy_uuid=""
+    local dummy_name=""
+    local phy_name=""
+    local hop_channel=""
+    local tshark_pid=""
+    local pkt_file=""
+    local -a PRIV_CMD
+    local -a hop_channels
 
-    if ! [[ "$DURATION" =~ ^[0-9]+$ ]] || [ "$DURATION" -le 0 ]; then
-        echo "Error: duration must be a positive integer (seconds)."
-        echo "Usage: netmgr bssid-scan [interface] [seconds]"
+    if [ -n "$DURATION_ARG" ]; then
+        if ! [[ "$DURATION_ARG" =~ ^[0-9]+$ ]] || [ "$DURATION_ARG" -le 0 ]; then
+            echo "Error: duration must be a positive integer (seconds)."
+            echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>]"
+            return 1
+        fi
+        DURATION="$DURATION_ARG"
+        finite_mode=1
+        duration_label="${DURATION}s"
+    fi
+
+    if [ -n "$TARGET_CHAN" ] && ! [[ "$TARGET_CHAN" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid channel value: $TARGET_CHAN"
         return 1
+    fi
+
+    if ! command -v tshark >/dev/null 2>&1; then
+        echo "Error: tshark is required for bssid-scan --realtime."
+        return 1
+    fi
+
+    if [ "$EUID" -eq 0 ]; then
+        PRIV_CMD=()
+    else
+        if ! sudo -v; then
+            echo "Error: sudo authentication failed."
+            return 1
+        fi
+        PRIV_CMD=(sudo)
+    fi
+
+    monitor_cleanup() {
+        if [ "$monitor_cleanup_done" -eq 1 ]; then
+            return 0
+        fi
+        monitor_cleanup_done=1
+
+        if [ -n "$channel_hop_pid" ]; then
+            kill "$channel_hop_pid" >/dev/null 2>&1 || true
+            wait "$channel_hop_pid" 2>/dev/null || true
+            channel_hop_pid=""
+        fi
+        if [ -n "$tshark_pid" ]; then
+            kill "$tshark_pid" >/dev/null 2>&1 || true
+            wait "$tshark_pid" 2>/dev/null || true
+            tshark_pid=""
+        fi
+
+        log_ok "Stopping realtime monitor mode and restoring managed/connected state on ${INTERFACE}..."
+        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection down "$HOTSPOT_CONN_NAME" >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection down netmgr_dummy >/dev/null 2>&1 || true
+        while IFS=: read -r dummy_uuid dummy_name; do
+            [ -z "$dummy_uuid" ] && continue
+            "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" >/dev/null 2>&1 || true
+        done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
+        "${PRIV_CMD[@]}" nmcli connection delete "$HOTSPOT_CONN_NAME" >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection delete netmgr_dummy >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli device set "$INTERFACE" managed yes >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" ip link set "$INTERFACE" up >/dev/null 2>&1 || true
+
+        reconnect_ok=0
+        if [ -n "$prev_conn_uuid" ]; then
+            if "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" >/dev/null 2>&1; then
+                reconnect_ok=1
+            fi
+        fi
+        if [ "$reconnect_ok" -eq 0 ]; then
+            if "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" >/dev/null 2>&1; then
+                reconnect_ok=1
+            fi
+        fi
+        if [ "$reconnect_ok" -eq 0 ]; then
+            "${PRIV_CMD[@]}" systemctl restart NetworkManager >/dev/null 2>&1 || true
+            sleep 1
+            if [ -n "$prev_conn_uuid" ] && "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" >/dev/null 2>&1; then
+                reconnect_ok=1
+            elif "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" >/dev/null 2>&1; then
+                reconnect_ok=1
+            fi
+        fi
+        for poll_i in 1 2 3 4 5 6; do
+            reconnect_conn=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null | awk -F: -v dev="$INTERFACE" '$1==dev && $2=="wifi" && $3=="connected" {print $4; exit}')
+            if [ -n "$reconnect_conn" ]; then
+                reconnect_ok=1
+                break
+            fi
+            sleep 1
+        done
+        device_state=$(nmcli -t -f GENERAL.STATE device show "$INTERFACE" 2>/dev/null | awk -F: '/^GENERAL.STATE:/ {print $2; exit}')
+        if [ "$reconnect_ok" -eq 1 ] && [ -n "$reconnect_conn" ]; then
+            log_ok "Reconnected ${INTERFACE} to Wi-Fi successfully (${reconnect_conn})."
+        elif [ "$reconnect_ok" -eq 1 ]; then
+            log_ok "Reconnect command completed for ${INTERFACE} (state: ${device_state:-unknown})."
+        else
+            log_err "Failed to reconnect ${INTERFACE} automatically."
+        fi
+
+        [ -n "$pkt_file" ] && rm -f "$pkt_file"
+    }
+
+    log_ok "Starting realtime BSSID scan on ${INTERFACE} using monitor mode..."
+    prev_conn_uuid=$(nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$INTERFACE" '$2==dev {print $1; exit}')
+    PHY_NUM=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" info 2>/dev/null | awk '/wiphy/ {print "phy"$2; exit}')
+    if [ -z "$PHY_NUM" ]; then
+        echo "Error: could not determine phy for interface ${INTERFACE}."
+        return 1
+    fi
+
+    log_ok "Preflight: ensuring stale monitor/hotspot resources do not exist..."
+    found_stale=0
+    if "${PRIV_CMD[@]}" iw dev | grep -qE '^[[:space:]]*Interface[[:space:]]+mon0$'; then
+        found_stale=1
+        log_ok "Preflight: deleting existing mon0."
+        "${PRIV_CMD[@]}" ip link set mon0 down >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+    fi
+    while IFS=: read -r dummy_uuid dummy_name; do
+        [ -z "$dummy_uuid" ] && continue
+        found_stale=1
+        log_ok "Preflight: deleting existing hotspot profile ${dummy_name} (uuid: $dummy_uuid)."
+        "${PRIV_CMD[@]}" nmcli connection down uuid "$dummy_uuid" >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" >/dev/null 2>&1 || true
+    done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
+    if [ "$found_stale" -eq 0 ]; then
+        log_ok "Preflight: no stale mon0/Netmgr_Awake/netmgr_dummy resources found."
+    fi
+
+    log_ok "Creating monitor interface mon0 on ${PHY_NUM}..."
+    if ! "${PRIV_CMD[@]}" iw phy "$PHY_NUM" interface add mon0 type monitor; then
+        echo "Error: failed to create mon0 on ${PHY_NUM}."
+        return 1
+    fi
+    if ! "${PRIV_CMD[@]}" ip link set mon0 up; then
+        echo "Error: failed to set mon0 up."
+        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! "${PRIV_CMD[@]}" iw dev | grep -qE '^[[:space:]]*Interface[[:space:]]+mon0$'; then
+        echo "Error: mon0 interface was not created successfully."
+        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        return 1
+    fi
+    "${PRIV_CMD[@]}" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+
+    phy_name=$("${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" info 2>/dev/null | awk '/wiphy/ {print "phy"$2; exit}')
+    if [ -n "$phy_name" ]; then
+        mapfile -t hop_channels < <("${PRIV_CMD[@]}" iw phy "$phy_name" info 2>/dev/null | awk '
+            /MHz \[/ && $0 !~ /disabled/ {
+                if (match($0, /\[([0-9]+)\]/, m)) print m[1]
+            }
+        ' | sort -n -u)
+    fi
+    if [ "${#hop_channels[@]}" -eq 0 ]; then
+        hop_channels=(1 6 11 36 40 44 48 149 153 157 161)
+    fi
+
+    if [ -n "$TARGET_CHAN" ]; then
+        log_ok "Initializing MediaTek wakeup sequence on channel ${TARGET_CHAN}..."
+        if [ "$TARGET_CHAN" -le 14 ]; then
+            BAND="bg"
+        else
+            BAND="a"
+        fi
+        log_ok "Igniting dummy hotspot to wake up hardware..."
+        hotspot_err=$("${PRIV_CMD[@]}" nmcli device wifi hotspot ifname "$INTERFACE" con-name "$HOTSPOT_CONN_NAME" ssid "Netmgr_Scan" password "$HOTSPOT_PSK" band "$BAND" channel "$TARGET_CHAN" 2>&1)
+        if [ $? -ne 0 ]; then
+            log_err "Failed to create dummy hotspot on ${INTERFACE} channel ${TARGET_CHAN}: ${hotspot_err}"
+        fi
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$TARGET_CHAN" >/dev/null 2>&1 || true
+        log_ok "Hardware awake and locked to channel ${TARGET_CHAN}."
+    fi
+
+    if [ -z "$TARGET_CHAN" ]; then
+        log_ok "No fixed channel specified; using channel hopping on ${CAPTURE_IF}."
+        (
+            while true; do
+                for hop_channel in "${hop_channels[@]}"; do
+                    "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$hop_channel" >/dev/null 2>&1 || true
+                    sleep 0.35
+                done
+            done
+        ) &
+        channel_hop_pid=$!
+    fi
+
+    pkt_file=$(mktemp)
+    "${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" \
+        -Y 'wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05' \
+        -T fields -E separator=$'\t' -E occurrence=f \
+        -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal -e wlan_radio.channel -e wlan_radio.frequency \
+        2>/dev/null > "$pkt_file" &
+    tshark_pid=$!
+
+    start_ms=$(date +%s%3N)
+    if [ "$finite_mode" -eq 1 ]; then
+        end_ms=$((start_ms + (DURATION * 1000)))
+    else
+        end_ms=0
+    fi
+    trap 'scan_interrupted=1' INT TERM
+
+    while :; do
+        now_ms=$(date +%s%3N)
+        if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+            tput cup 0 0 >/dev/null 2>&1 || printf "\033[H"
+            tput ed >/dev/null 2>&1 || printf "\033[2J"
+        else
+            printf "\033[H\033[2J"
+        fi
+        echo "Realtime BSSID scan on ${INTERFACE} via ${CAPTURE_IF} (monitor mode, live refresh 0.5s)..."
+        if [ "$finite_mode" -eq 1 ]; then
+            remaining_s=$(((end_ms - now_ms + 999) / 1000))
+            if [ "$remaining_s" -lt 0 ]; then
+                remaining_s=0
+            fi
+            echo "Time remaining: ${remaining_s}s (Ctrl+C to stop)"
+        else
+            echo "Running continuously (Ctrl+C to stop)"
+        fi
+        echo "--------------------------------------------------------------------------------"
+
+        if [ -s "$pkt_file" ]; then
+            {
+                printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tSignal_pct\tRSSI_dBm\n"
+                tail -n 4000 "$pkt_file" | awk -F'\t' '
+                    function normalize_mac(m, a, i, out) {
+                        gsub(/-/, ":", m)
+                        m = tolower(m)
+                        n = split(m, a, ":")
+                        if (n != 6) return ""
+                        out = ""
+                        for (i = 1; i <= 6; i++) {
+                            if (a[i] !~ /^[0-9a-f]{1,2}$/) return ""
+                            if (length(a[i]) == 1) a[i] = "0" a[i]
+                            out = out ((i == 1) ? "" : ":") a[i]
+                        }
+                        return out
+                    }
+                    function maybe_decode_ssid(s,    h, i, b, v, out) {
+                        if (s == "" || s == "<MISSING>") return ""
+                        h = s
+                        sub(/^0x/, "", h)
+                        if (h ~ /^[0-9A-Fa-f]+$/ && (length(h) % 2) == 0) {
+                            out = ""
+                            for (i = 1; i <= length(h); i += 2) {
+                                b = substr(h, i, 2)
+                                v = strtonum("0x" b)
+                                if (v == 0) continue
+                                out = out sprintf("%c", v)
+                            }
+                            if (out != "") return out
+                        }
+                        return s
+                    }
+                    function band_for_freq(f, c) {
+                        if (f ~ /^[0-9]+$/) {
+                            if ((f + 0) >= 2400 && (f + 0) < 2500) return "2.4GHz"
+                            if ((f + 0) >= 4900 && (f + 0) < 5950) return "5GHz"
+                            if ((f + 0) >= 5950 && (f + 0) <= 7125) return "6GHz"
+                        }
+                        if (c ~ /^[0-9]+$/ && (c + 0) >= 1 && (c + 0) <= 14) return "2.4GHz"
+                        if (c ~ /^[0-9]+$/) return "5GHz"
+                        return "?"
+                    }
+                    {
+                        b = normalize_mac($1)
+                        if (b == "") next
+                        ssid = maybe_decode_ssid($2)
+                        rssi = $3
+                        ch = $4
+                        fr = $5
+                        if (ssid != "") ssid_map[b] = ssid
+                        if (ch != "") ch_map[b] = ch
+                        if (fr != "") fr_map[b] = fr
+                        if (rssi ~ /^-?[0-9]+$/) rssi_map[b] = rssi + 0
+                    }
+                    END {
+                        for (b in rssi_map) {
+                            s = (b in ssid_map && ssid_map[b] != "") ? ssid_map[b] : "<hidden>"
+                            c = (b in ch_map && ch_map[b] != "") ? ch_map[b] : "?"
+                            f = (b in fr_map && fr_map[b] != "") ? fr_map[b] : "?"
+                            r = rssi_map[b]
+                            p = int((r + 100) * 2)
+                            if (p < 0) p = 0
+                            if (p > 100) p = 100
+                            gsub(/ /, "_", s)
+                            printf "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n", toupper(b), s, c, f, band_for_freq(f, c), p, r, r
+                        }
+                    }
+                ' | sort -t $'\t' -k8,8nr -k1,1V | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,$4,$5,$6,$7}'
+            } | column -t -s $'\t' | sed 's/_/ /g'
+        else
+            echo "No monitor frames yet."
+        fi
+        echo "--------------------------------------------------------------------------------"
+
+        if [ "$scan_interrupted" -eq 1 ] || { [ "$finite_mode" -eq 1 ] && [ "$now_ms" -ge "$end_ms" ]; }; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    trap - INT TERM
+    monitor_cleanup
+    echo ""
+    if [ "$scan_interrupted" -eq 1 ]; then
+        return 130
+    fi
+    return 0
+}
+
+bssid_scan() {
+    local INTERFACE="wlp8s0"
+    local DURATION_ARG=""
+    local REALTIME=0
+    local TARGET_CHAN=""
+    local arg=""
+    local DURATION=0
+    local duration_label="forever"
+    local finite_mode=0
+    local start_ms=0
+    local now_ms=0
+    local end_ms=0
+    local remaining_s=0
+    local next_rescan_ms=0
+    local rescan_interval_ms=4000
+    local scan_interrupted=0
+    local table_rows=""
+
+    while [ $# -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            --realtime)
+                REALTIME=1
+                ;;
+            --channel)
+                shift
+                if [ -z "${1:-}" ]; then
+                    echo "Error: --channel requires a value."
+                    echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>]"
+                    return 1
+                fi
+                TARGET_CHAN="$1"
+                ;;
+            *)
+                if [[ "$arg" =~ ^(en|eth|wl|v|do|lo)[0-9a-z]*$ ]]; then
+                    INTERFACE="$arg"
+                elif [[ "$arg" =~ ^[0-9]+$ ]] && [ -z "$DURATION_ARG" ]; then
+                    DURATION_ARG="$arg"
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    if [ "$REALTIME" -eq 1 ]; then
+        bssid_scan_realtime "$INTERFACE" "$DURATION_ARG" "$TARGET_CHAN"
+        return $?
+    fi
+
+    if [ -n "$DURATION_ARG" ]; then
+        if ! [[ "$DURATION_ARG" =~ ^[0-9]+$ ]] || [ "$DURATION_ARG" -le 0 ]; then
+            echo "Error: duration must be a positive integer (seconds)."
+            echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>]"
+            return 1
+        fi
+        DURATION="$DURATION_ARG"
+        duration_label="${DURATION}s"
+        finite_mode=1
     fi
 
     if ! command -v nmcli >/dev/null 2>&1; then
@@ -915,17 +1310,23 @@ bssid_scan() {
         return 1
     fi
 
-    echo "Scanning BSSIDs in managed mode on ${INTERFACE} for ${DURATION}s..."
-    tmp_rows=$(mktemp)
-    end_ts=$((SECONDS + DURATION))
+    start_ms=$(date +%s%3N)
+    if [ "$finite_mode" -eq 1 ]; then
+        end_ms=$((start_ms + (DURATION * 1000)))
+    else
+        end_ms=0
+    fi
+    next_rescan_ms="$start_ms"
+    trap 'scan_interrupted=1' INT TERM
 
-    while [ "$SECONDS" -lt "$end_ts" ]; do
-        nmcli dev wifi rescan ifname "$INTERFACE" >/dev/null 2>&1 || true
-        nmcli -e no -t -f BSSID,CHAN,FREQ,SIGNAL,SSID dev wifi list ifname "$INTERFACE" 2>/dev/null >> "$tmp_rows"
-        sleep 2
-    done
+    while :; do
+        now_ms=$(date +%s%3N)
+        if [ "$now_ms" -ge "$next_rescan_ms" ]; then
+            nmcli dev wifi rescan ifname "$INTERFACE" >/dev/null 2>&1 || true
+            next_rescan_ms=$((now_ms + rescan_interval_ms))
+        fi
 
-    awk -F: '
+        table_rows=$(nmcli -e no -t -f BSSID,CHAN,FREQ,SIGNAL,SSID dev wifi list --rescan no ifname "$INTERFACE" 2>/dev/null | awk -F: '
         function normalize_mac(m, a, i, out) {
             gsub(/-/, ":", m)
             m = tolower(m)
@@ -989,26 +1390,48 @@ bssid_scan() {
             for (b in seen) {
                 gsub(/ /, "_", ssid[b])
                 sig_disp = has_sig[b] ? best_sig[b] : "N/A"
+                rssi_disp = has_sig[b] ? int((best_sig[b] / 2) - 100) : "N/A"
                 band_disp = band_for_freq(freq[b], chan[b])
                 freq_disp = (freq[b] == "" ? "?" : freq[b])
-                printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\n", toupper(b), ssid[b], chan[b], freq_disp, band_disp, sig_disp, seen[b]
+                sig_sort = has_sig[b] ? best_sig[b] : -1
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n", toupper(b), ssid[b], chan[b], freq_disp, band_disp, sig_disp, rssi_disp, sig_sort
             }
         }
-    ' "$tmp_rows" | sort -V > "${tmp_rows}.out"
+    ' | sort -t $'\t' -k8,8nr -k1,1V | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,$4,$5,$6,$7}')
 
-    echo "--------------------------------------------------------------------------------"
-    (
-        printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tSignal_pct\tSeen\n"
-        cat "${tmp_rows}.out"
-    ) | column -t -s $'\t' | sed 's/_/ /g'
-    echo "--------------------------------------------------------------------------------"
+        printf "\033[H\033[2J"
+        echo "Scanning BSSIDs in managed mode on ${INTERFACE} for ${duration_label} (live refresh 0.5s)..."
+        if [ "$finite_mode" -eq 1 ]; then
+            remaining_s=$(((end_ms - now_ms + 999) / 1000))
+            if [ "$remaining_s" -lt 0 ]; then
+                remaining_s=0
+            fi
+            echo "Time remaining: ${remaining_s}s (Ctrl+C to stop)"
+        else
+            echo "Running continuously (Ctrl+C to stop)"
+        fi
+        echo "--------------------------------------------------------------------------------"
+        if [ -n "$table_rows" ]; then
+            {
+                printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tSignal_pct\tRSSI_dBm\n"
+                printf "%s\n" "$table_rows"
+            } | column -t -s $'\t' | sed 's/_/ /g'
+        else
+            echo "No BSSIDs currently visible."
+        fi
+        echo "--------------------------------------------------------------------------------"
+
+        if [ "$scan_interrupted" -eq 1 ] || { [ "$finite_mode" -eq 1 ] && [ "$now_ms" -ge "$end_ms" ]; }; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    trap - INT TERM
     echo ""
-
-    if [ ! -s "${tmp_rows}.out" ]; then
-        echo "No BSSIDs detected during ${DURATION}s managed scan."
+    if [ "$scan_interrupted" -eq 1 ]; then
+        return 130
     fi
-
-    rm -f "$tmp_rows" "${tmp_rows}.out"
 }
 
 listen_subnet() {
@@ -1773,6 +2196,13 @@ run_traceroute() {
     local hop_median=""
     local hop_best=""
     local have_nc=0
+    local trace_raw=""
+    local dublin_npaths=24
+    local dublin_delay_ms=30
+    local dublin_dport=33434
+    local trace_engine="classic"
+    local trace_bin="traceroute"
+    local -a TRACE_CMD=(traceroute)
     local -a resolved_ips=()
     local -a resolved_v4=()
     local -a resolved_v6=()
@@ -1937,7 +2367,6 @@ run_traceroute() {
         trace_intf="$route_dev"
     fi
     if [ -n "$trace_intf" ]; then
-        trace_tool_intf_args=(-i "$trace_intf")
         ping_iface_args=(-I "$trace_intf")
     fi
 
@@ -1960,9 +2389,36 @@ run_traceroute() {
     else
         log_err "Could not determine route details for ${target}; using system defaults."
     fi
-    if ! command -v traceroute >/dev/null 2>&1; then
-        log_err "traceroute command not found."
+    if command -v dublin-traceroute >/dev/null 2>&1; then
+        trace_engine="dublin"
+        trace_bin="dublin-traceroute"
+    else
+        log_err "dublin-traceroute is required for this traceroute flow. Install it and retry."
         return 1
+    fi
+    TRACE_CMD=("$trace_bin")
+    trace_tool_intf_args=()
+    if [ -n "$trace_intf" ]; then
+        log_ok "${trace_bin} selected; interface pinning is not supported, using route-selected egress."
+    fi
+    if [ "$trace_family" = "-6" ]; then
+        log_err "dublin-traceroute CLI (this flow) supports IPv4 only. Use an IPv4 target."
+        return 1
+    fi
+
+    if [ "$EUID" -ne 0 ]; then
+        log_ok "Authenticating sudo for traceroute probe methods..."
+        if ! sudo -v; then
+            log_err "sudo authentication failed."
+            return 1
+        fi
+        TRACE_CMD=(sudo "$trace_bin")
+    fi
+    log_ok "Discovery engine: ${trace_bin}"
+    if [ "$trace_engine" = "dublin" ]; then
+        discovery_rounds=1
+        log_ok "Dublin mode: single discovery round only (no ICMP/TCP supplemental probes)."
+        log_ok "Dublin options: --broken-nat --delay=${dublin_delay_ms} --npaths=${dublin_npaths} --dport=${dublin_dport}"
     fi
     if command -v nc >/dev/null 2>&1; then
         have_nc=1
@@ -1973,9 +2429,44 @@ run_traceroute() {
         discovery_rounds=5
     fi
 
-    if [ "$trace_family" = "-4" ]; then
+    if [ "$trace_engine" = "dublin" ] && [ "$trace_family" = "-4" ]; then
+        trace_raw=$("${TRACE_CMD[@]}" --broken-nat --delay="${dublin_delay_ms}" --npaths="${dublin_npaths}" --dport="${dublin_dport}" "$target" 2>/dev/null || true)
+        echo "[DEBUG] dublin-r1:"
+        if [ -n "$trace_raw" ]; then
+            printf "%s\n" "$trace_raw"
+        else
+            echo "(no output)"
+        fi
+        printf "%s\n" "$trace_raw" | awk -v s="dublin-r1" '
+            NR > 1 && $1 ~ /^[0-9]+$/ {
+                hop = $1 + 0
+                if (index($0, "* * *") > 0) {
+                    print s "\t" hop "\t*"
+                    next
+                }
+                for (i = 2; i <= NF; i++) {
+                    tok = $i
+                    gsub(/[(),]/, "", tok)
+                    if (tok ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+                        print s "\t" hop "\t" tok
+                    }
+                }
+            }
+        ' >> "$route_hops_raw"
+    elif [ "$trace_family" = "-4" ]; then
         for ((round = 1; round <= discovery_rounds; round++)); do
-            traceroute -4 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="udp-r${round}" '
+            if [ "$trace_engine" = "paris" ]; then
+                trace_raw=$("${TRACE_CMD[@]}" -n -p udp "$target" 2>/dev/null || true)
+            else
+                trace_raw=$("${TRACE_CMD[@]}" -4 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            fi
+            echo "[DEBUG] udp-r${round}:"
+            if [ -n "$trace_raw" ]; then
+                printf "%s\n" "$trace_raw"
+            else
+                echo "(no output)"
+            fi
+            printf "%s\n" "$trace_raw" | awk -v s="udp-r${round}" '
                 NR > 1 && $1 ~ /^[0-9]+$/ {
                     hop = $1 + 0
                     for (i = 2; i <= NF; i++) {
@@ -1987,7 +2478,18 @@ run_traceroute() {
                     }
                 }
             ' >> "$route_hops_raw"
-            traceroute -4 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="icmp-r${round}" '
+            if [ "$trace_engine" = "paris" ]; then
+                trace_raw=$("${TRACE_CMD[@]}" -n -p icmp "$target" 2>/dev/null || true)
+            else
+                trace_raw=$("${TRACE_CMD[@]}" -4 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            fi
+            echo "[DEBUG] icmp-r${round}:"
+            if [ -n "$trace_raw" ]; then
+                printf "%s\n" "$trace_raw"
+            else
+                echo "(no output)"
+            fi
+            printf "%s\n" "$trace_raw" | awk -v s="icmp-r${round}" '
                 NR > 1 && $1 ~ /^[0-9]+$/ {
                     hop = $1 + 0
                     for (i = 2; i <= NF; i++) {
@@ -1999,7 +2501,18 @@ run_traceroute() {
                     }
                 }
             ' >> "$route_hops_raw"
-            traceroute -4 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="tcp-r${round}" '
+            if [ "$trace_engine" = "paris" ]; then
+                trace_raw=$("${TRACE_CMD[@]}" -n -p tcp -d 443 "$target" 2>/dev/null || true)
+            else
+                trace_raw=$("${TRACE_CMD[@]}" -4 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            fi
+            echo "[DEBUG] tcp-r${round}:"
+            if [ -n "$trace_raw" ]; then
+                printf "%s\n" "$trace_raw"
+            else
+                echo "(no output)"
+            fi
+            printf "%s\n" "$trace_raw" | awk -v s="tcp-r${round}" '
                 NR > 1 && $1 ~ /^[0-9]+$/ {
                     hop = $1 + 0
                     for (i = 2; i <= NF; i++) {
@@ -2014,7 +2527,14 @@ run_traceroute() {
         done
     else
         for ((round = 1; round <= discovery_rounds; round++)); do
-            traceroute -6 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="udp-r${round}" '
+            trace_raw=$("${TRACE_CMD[@]}" -6 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            echo "[DEBUG] udp-r${round}:"
+            if [ -n "$trace_raw" ]; then
+                printf "%s\n" "$trace_raw"
+            else
+                echo "(no output)"
+            fi
+            printf "%s\n" "$trace_raw" | awk -v s="udp-r${round}" '
                 NR > 1 && $1 ~ /^[0-9]+$/ {
                     hop = $1 + 0
                     for (i = 2; i <= NF; i++) {
@@ -2027,7 +2547,14 @@ run_traceroute() {
                     }
                 }
             ' >> "$route_hops_raw"
-            traceroute -6 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="icmp-r${round}" '
+            trace_raw=$("${TRACE_CMD[@]}" -6 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            echo "[DEBUG] icmp-r${round}:"
+            if [ -n "$trace_raw" ]; then
+                printf "%s\n" "$trace_raw"
+            else
+                echo "(no output)"
+            fi
+            printf "%s\n" "$trace_raw" | awk -v s="icmp-r${round}" '
                 NR > 1 && $1 ~ /^[0-9]+$/ {
                     hop = $1 + 0
                     for (i = 2; i <= NF; i++) {
@@ -2040,7 +2567,14 @@ run_traceroute() {
                     }
                 }
             ' >> "$route_hops_raw"
-            traceroute -6 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null | awk -v s="tcp-r${round}" '
+            trace_raw=$("${TRACE_CMD[@]}" -6 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            echo "[DEBUG] tcp-r${round}:"
+            if [ -n "$trace_raw" ]; then
+                printf "%s\n" "$trace_raw"
+            else
+                echo "(no output)"
+            fi
+            printf "%s\n" "$trace_raw" | awk -v s="tcp-r${round}" '
                 NR > 1 && $1 ~ /^[0-9]+$/ {
                     hop = $1 + 0
                     for (i = 2; i <= NF; i++) {
@@ -2056,11 +2590,55 @@ run_traceroute() {
         done
     fi
 
-    awk -F'\t' '
+    if [ "$trace_engine" = "dublin" ]; then
+        awk -F'\t' '
+            $2 + 0 > 0 {
+                hop = $2 + 0
+                ip = $3
+                hops[hop] = 1
+                if (ip == "*") {
+                    missing[hop] = 1
+                } else if (ip != "") {
+                    seen[hop SUBSEP ip] = 1
+                }
+            }
+            END {
+                for (h in hops) {
+                    has_ip = 0
+                    for (k in seen) {
+                        split(k, p, SUBSEP)
+                        if ((p[1] + 0) == h) {
+                            print h "\t" p[2]
+                            has_ip = 1
+                        }
+                    }
+                    if (!has_ip && (h in missing)) {
+                        print h "\t*"
+                    }
+                }
+            }
+        ' "$route_hops_raw" | sort -n -k1,1n -k2,2 > "$route_hops_file"
+    else
+        awk -F'\t' '
         function list_has(list, item, arr, n, i) {
             n = split(list, arr, " ")
             for (i = 1; i <= n; i++) {
                 if (arr[i] == item) return 1
+            }
+            return 0
+        }
+        function abs(x) {
+            return x < 0 ? -x : x
+        }
+        function set_overlap(a, b, aa, bb, na, nb, i, j) {
+            if (a == "" || b == "") return 0
+            na = split(a, aa, " ")
+            nb = split(b, bb, " ")
+            for (i = 1; i <= na; i++) {
+                if (aa[i] == "") continue
+                for (j = 1; j <= nb; j++) {
+                    if (aa[i] == bb[j] && bb[j] != "") return 1
+                }
             }
             return 0
         }
@@ -2073,6 +2651,7 @@ run_traceroute() {
             ips[ip] = 1
             scans[scan] = 1
             if (!(ip in minhop) || hop < minhop[ip]) minhop[ip] = hop
+            if (!(ip in maxhop_ip) || hop > maxhop_ip[ip]) maxhop_ip[ip] = hop
             sumhop[ip] += hop
             cnt[ip]++
 
@@ -2127,6 +2706,19 @@ run_traceroute() {
                 if (!changed) break
             }
 
+            for (e in edge) {
+                split(e, uv, SUBSEP)
+                u = uv[1]
+                v = uv[2]
+                pair_forward[u SUBSEP v] = 1
+
+                if (!(v in pred)) pred[v] = u
+                else if (!list_has(pred[v], u)) pred[v] = pred[v] " " u
+
+                if (!(u in succ)) succ[u] = v
+                else if (!list_has(succ[u], v)) succ[u] = succ[u] " " v
+            }
+
             for (iter = 1; iter <= nips; iter++) {
                 best = ""
                 for (ip in ips) {
@@ -2151,19 +2743,50 @@ run_traceroute() {
                 }
             }
 
+            for (iter = 1; iter <= nips * 2; iter++) {
+                changed = 0
+                for (a in ips) {
+                    for (b in ips) {
+                        if (a >= b) continue
+                        if (pair_forward[a SUBSEP b] || pair_forward[b SUBSEP a]) continue
+                        if (cnt[a] < 2 || cnt[b] < 2) continue
+                        if (abs(score[a] - score[b]) > 1.25) continue
+                        if (maxhop_ip[a] < (minhop[b] - 1) || maxhop_ip[b] < (minhop[a] - 1)) continue
+                        if (!set_overlap(pred[a], pred[b]) && !set_overlap(succ[a], succ[b])) continue
+
+                        low = (level[a] <= level[b]) ? level[a] : level[b]
+                        if (level[a] != low || level[b] != low) {
+                            level[a] = low
+                            level[b] = low
+                            changed = 1
+                        }
+                    }
+                }
+                for (e in edge) {
+                    split(e, uv, SUBSEP)
+                    u = uv[1]
+                    v = uv[2]
+                    if (level[v] <= level[u]) {
+                        level[v] = level[u] + 1
+                        changed = 1
+                    }
+                }
+                if (!changed) break
+            }
+
             for (ip in ips) {
                 if (level[ip] < 1) level[ip] = 1
                 printf "%d\t%.6f\t%d\t%s\n", level[ip], score[ip], minhop[ip], ip
             }
         }
-    ' "$route_hops_raw" | sort -n -k1,1n -k2,2n -k3,3n -k4,4 | awk -F'\t' 'BEGIN {OFS="\t"} {if (!($1 in level_map)) level_map[$1] = ++next_level; print level_map[$1], $4}' > "$route_hops_file"
+    ' "$route_hops_raw" | sort -n -k1,1n -k2,2n -k3,3n -k4,4 | awk -F'\t' 'BEGIN {OFS="\t"} {if (!($1 in level_map)) level_map[$1] = ++next_level; print level_map[$1], $2, $3, $4}' | sort -n -k1,1n -k2,2n -k3,3n -k4,4 | awk -F'\t' '{print $1 "\t" $4}' > "$route_hops_file"
+    fi
 
     if ! awk -F'\t' -v t="$target" '$2 == t {found=1} END {exit found ? 0 : 1}' "$route_hops_file" 2>/dev/null; then
         max_hop=$(awk -F'\t' 'BEGIN {m=0} $1+0 > m {m=$1+0} END {print m}' "$route_hops_file")
         [ -z "$max_hop" ] && max_hop=0
         printf "%d\t%s\n" "$((max_hop + 1))" "$target" >> "$route_hops_file"
     fi
-    sort -n -k1,1n -k2,2 -o "$route_hops_file" "$route_hops_file"
 
     if [ ! -s "$route_hops_file" ]; then
         log_err "No hops discovered."
@@ -2272,6 +2895,10 @@ run_traceroute() {
         printf "Hop IP_Address Loss Median Lowest Netname ASN Location\n"
         while IFS=$'\t' read -r hop hop_ip; do
             [ -z "$hop_ip" ] && continue
+            if [ "$hop_ip" = "*" ]; then
+                printf "%s %s %s %s %s %s %s %s\n" "$hop" "*_*_*" "N/A" "N/A" "N/A" "unknown" "N/A" "N/A"
+                continue
+            fi
             if [ "$hop_ip" = "$target" ]; then
                 if [ "$trace_family" = "-6" ] && [ "$have_nc" -eq 0 ]; then
                     collect_icmp_metrics "$hop_ip" "$trace_family"
@@ -2298,7 +2925,7 @@ show_help() {
     echo "  scan [intf] [target] [--ports] [--resolve-hostnames] - Host discovery scan; optional port scan and getent hostname resolution."
     echo "  ports               - Show active listening ports (TCP/UDP)."
     echo "  listen [intf] [managed|monitor] [--channel n] [--bssid mac] [--dedupe] - Listener; managed default, monitor optional."
-    echo "  bssid-scan [intf] [seconds] - Discover BSSID, SSID, channel, and signal in managed mode."
+    echo "  bssid-scan [intf] [seconds] [--realtime] [--channel n] - Discover BSSID/SSID/channel/signal; --realtime uses monitor mode live RSSI."
     echo "  fingerprint <ip> [--fast] - Run aggressive fingerprint scan; --fast scans top 100 ports."
     echo "  traceroute [intf] [target] - Deep traceroute with Edge Node identification."
     echo "  version             - Show netmgr version."
