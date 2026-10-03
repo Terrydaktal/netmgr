@@ -3,73 +3,83 @@
 # netmgr - Network management tool
 # Mimics diskpart style interactive shell and subcommands
 
-NETMGR_VERSION="0.0.8"
+NETMGR_VERSION="0.0.13-hotspot"
 MAC_IP_DB="${NETMGR_MAC_IP_DB:-$HOME/.local/share/netmgr/mac_ip_map.tsv}"
+declare -A VENDOR_CACHE=() VENDOR_PREFIXES=() MAC_IP_HINTS=()
+VENDOR_DB_LOADED=""
+MAC_IP_HINTS_LOADED=0
+MAC_IP_HINTS_REFRESHED=0
 
 # Helper to convert IP range (8.8.8.0 - 8.8.8.255) to CIDR suffix (/24)
 range_to_suffix() {
-    local range="$1"
+    local range="$1" start_ip="" end_ip="" start_int=0 end_int=0 differing=0 bits=0
     if [[ "$range" != *" - "* ]]; then
         if [[ "$range" == *"/"* ]]; then echo "/${range#*/}"; else echo ""; fi
         return
     fi
 
-    local start_ip=$(echo "$range" | awk -F' - ' '{print $1}' | xargs)
-    local end_ip=$(echo "$range" | awk -F' - ' '{print $2}' | xargs)
-
-    IFS='.' read -r a b c d <<< "$start_ip"
-    local start_int=$(( (a << 24) + (b << 16) + (c << 8) + d ))
-    IFS='.' read -r a b c d <<< "$end_ip"
-    local end_int=$(( (a << 24) + (b << 16) + (c << 8) + d ))
-
-    local diff=$(( end_int - start_int ))
-    local bits=0
-    while [ $(( 2**bits - 1 )) -lt $diff ]; do
-        ((bits++))
+    start_ip="${range%% - *}"
+    end_ip="${range##* - }"
+    ipv4_to_int "$start_ip" start_int && ipv4_to_int "$end_ip" end_int || return 1
+    ((start_int <= end_int)) || return 1
+    differing=$((start_int ^ end_int))
+    while ((differing > 0)); do
+        bits=$((bits + 1))
+        differing=$((differing >> 1))
     done
-    
-    echo "/$(( 32 - bits ))"
+
+    echo "/$((32 - bits))"
 }
 
 # Helper to find correct local CIDR for an IP (using routing table)
 get_local_cidr() {
-    local ip="$1"
-    local cidr=$(ip addr show | grep -w "inet" | awk '{print $2}' | grep -v "127.0.0.1" | while read -r line; do
-        if [[ $ip == ${line%.*}.* ]]; then
-            echo "$line"
-            return
+    local ip="$1" cidr="" best_prefix=-1 prefix=0
+    while IFS= read -r cidr; do
+        if ipv4_in_cidr "$ip" "$cidr"; then
+            prefix="${cidr#*/}"
+            ((10#$prefix > best_prefix)) && best_prefix=$((10#$prefix))
         fi
-    done | head -n 1)
-
-    if [ -n "$cidr" ]; then
-        echo "/${cidr#*/}"
-    else
-        if [[ $ip =~ ^192\.168\. ]]; then echo "/24";
-        elif [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then echo "/12";
-        elif [[ $ip =~ ^10\. ]]; then echo "/8";
-        else echo ""; fi
-    fi
+    done < <(ip -o -4 address show 2> /dev/null | awk '{print $4}')
+    if ((best_prefix >= 0)); then printf '/%s\n' "$best_prefix"; else printf '\n'; fi
 }
 
 normalize_mac() {
-    local raw="$1"
-    echo "$raw" | tr '[:upper:]-' '[:lower:]:' | awk -F: '
-        NF == 6 {
-            for (i = 1; i <= 6; i++) {
-                if ($i !~ /^[0-9a-f]{2}$/) {
-                    exit 1
-                }
-            }
-            printf "%s:%s:%s:%s:%s:%s\n", $1, $2, $3, $4, $5, $6
-        }
-    '
+    local normalized="${1,,}"
+    normalized="${normalized//-/:}"
+    [[ "$normalized" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
+    printf '%s\n' "$normalized"
+}
+
+is_device_mac() {
+    [[ "$1" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
+    [[ "$1" != 00:00:00:00:00:00 ]] && (((16#${1:0:2} & 1) == 0))
+}
+
+ipv4_to_int() {
+    local octet result=0
+    local -a octets
+    [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$1"
+    for octet in "${octets[@]}"; do
+        ((10#$octet <= 255)) || return 1
+        result=$(((result << 8) | 10#$octet))
+    done
+    printf -v "$2" '%s' "$result"
+}
+
+ipv4_in_cidr() {
+    local candidate=0 network=0 prefix="${2#*/}" mask=0
+    [[ "$prefix" =~ ^[0-9]{1,2}$ ]] && ((10#$prefix <= 32)) || return 1
+    ipv4_to_int "$1" candidate && ipv4_to_int "${2%/*}" network || return 1
+    mask=$(((0xffffffff << (32 - 10#$prefix)) & 0xffffffff))
+    (((candidate & mask) == (network & mask)))
 }
 
 map_protocol_token() {
     local token="$1"
     case "$token" in
-        frame|data|geninfo|ethertype) echo "" ;;
-        radiotap|wlan_radio) echo "Radiotap" ;;
+        frame | data | geninfo | ethertype) echo "" ;;
+        radiotap | wlan_radio) echo "Radiotap" ;;
         wlan) echo "802.11" ;;
         llc) echo "LLC" ;;
         eth) echo "Ethernet" ;;
@@ -80,13 +90,13 @@ map_protocol_token() {
         udp) echo "UDP" ;;
         icmp) echo "ICMP" ;;
         icmpv6) echo "ICMPv6" ;;
-        bootp|dhcp) echo "DHCP" ;;
+        bootp | dhcp) echo "DHCP" ;;
         dns) echo "DNS" ;;
         mdns) echo "mDNS" ;;
         ssdp) echo "SSDP" ;;
-        tls|ssl) echo "TLS" ;;
+        tls | ssl) echo "TLS" ;;
         quic) echo "QUIC" ;;
-        http|http2|http3) echo "HTTP" ;;
+        http | http2 | http3) echo "HTTP" ;;
         eapol) echo "EAPOL" ;;
         *)
             echo "$token" | tr '[:lower:]' '[:upper:]'
@@ -149,9 +159,9 @@ format_protocol_stack() {
 
     if [ -n "$app_proto" ]; then
         case "$app_proto" in
-            ''|[0-9]*)
+            '' | [0-9]*)
                 ;;
-            "TCP"|"UDP"|"IPv4"|"IPv6"|"Ethernet"|"ARP"|"802.11")
+            "TCP" | "UDP" | "IPv4" | "IPv6" | "Ethernet" | "ARP" | "802.11")
                 ;;
             *)
                 if [ "$stack" = "Ethernet" ]; then
@@ -181,122 +191,82 @@ format_protocol_stack() {
 }
 
 lookup_vendor() {
-    local mac_in="$1"
-    local mac=""
-    local vendor=""
-    local prefix=""
+    local vendor_mac=""
+    local vendor_result="Unknown"
+    local vendor_prefix=""
+    local prefix_name=""
     local mac_db="${NETMGR_MAC_PREFIX_DB:-/usr/share/nmap/nmap-mac-prefixes}"
 
-    mac=$(normalize_mac "$mac_in")
-    if [ -z "$mac" ]; then
-        echo "Unknown"
-        return
+    vendor_mac=$(normalize_mac "$1") || vendor_mac=""
+    if is_device_mac "$vendor_mac"; then
+        if [[ -n "${VENDOR_CACHE[$vendor_mac]+x}" ]]; then
+            vendor_result="${VENDOR_CACHE[$vendor_mac]}"
+        elif (((16#${vendor_mac:0:2} & 2) != 0)); then
+            vendor_result="Private/randomized MAC"
+        else
+            if [[ "$VENDOR_DB_LOADED" != "$mac_db" ]]; then
+                VENDOR_PREFIXES=()
+                if [[ -r "$mac_db" ]]; then
+                    while read -r vendor_prefix prefix_name; do
+                        [[ "$vendor_prefix" =~ ^[[:xdigit:]]{6}$ ]] || continue
+                        VENDOR_PREFIXES["${vendor_prefix^^}"]="$prefix_name"
+                    done < "$mac_db"
+                fi
+                VENDOR_DB_LOADED="$mac_db"
+            fi
+            vendor_prefix="${vendor_mac//:/}"
+            vendor_prefix="${vendor_prefix:0:6}"
+            vendor_result="${VENDOR_PREFIXES[${vendor_prefix^^}]:-Unknown}"
+            if [[ "$vendor_result" == Unknown && "${NETMGR_VENDOR_ONLINE:-0}" == 1 ]]; then
+                vendor_result=$(curl -fsS --connect-timeout 1 --max-time 2 "https://api.macvendors.com/$vendor_mac" 2> /dev/null | tr -d '\r\n') || vendor_result="Unknown"
+                [[ -n "$vendor_result" && "$vendor_result" != *'{'* ]] || vendor_result="Unknown"
+            fi
+        fi
+        VENDOR_CACHE["$vendor_mac"]="$vendor_result"
     fi
-
-    if [ -n "${VENDOR_CACHE[$mac]+x}" ]; then
-        echo "${VENDOR_CACHE[$mac]}"
-        return
+    if [[ -n "${2:-}" ]]; then
+        printf -v "$2" '%s' "$vendor_result"
+    else
+        printf '%s\n' "$vendor_result"
     fi
-
-    prefix=$(echo "$mac" | tr -d ':' | cut -c1-6 | tr '[:lower:]' '[:upper:]')
-    if [ -r "$mac_db" ]; then
-        vendor=$(awk -v p="$prefix" '
-            toupper($1) == p {
-                $1 = ""
-                sub(/^[ \t]+/, "", $0)
-                print
-                exit
-            }
-        ' "$mac_db")
-    fi
-
-    if [ -z "$vendor" ]; then
-        vendor=$(curl -s --max-time 2 "https://api.macvendors.com/$mac" | tr -d '\r')
-    fi
-    if [[ -z "$vendor" || "$vendor" == *"error"* || "$vendor" == *"Too Many Requests"* ]]; then
-        vendor="Unknown"
-    fi
-
-    VENDOR_CACHE["$mac"]="$vendor"
-    echo "$vendor"
-}
-
-ensure_mac_ip_db() {
-    local db_dir=""
-    db_dir=$(dirname "$MAC_IP_DB")
-    mkdir -p "$db_dir"
-    touch "$MAC_IP_DB"
 }
 
 lookup_ip_from_db() {
-    local mac_in="$1"
-    local mac_norm=""
-    local ip_out=""
-
-    mac_norm=$(normalize_mac "$mac_in")
-    if [ -z "$mac_norm" ]; then
-        echo ""
-        return
+    local hint_mac=""
+    local hint_ip=""
+    local hint_seen=""
+    local hint_now=0
+    local hint_ttl="${NETMGR_MAC_IP_TTL:-86400}"
+    local hint_result=""
+    local -A latest=()
+    [[ "$hint_ttl" =~ ^[0-9]+$ && ${#hint_ttl} -le 8 ]] || hint_ttl=86400
+    hint_ttl=$((10#$hint_ttl))
+    hint_now=$EPOCHSECONDS
+    if [[ "$MAC_IP_HINTS_LOADED" -eq 0 ]] || ((hint_now - MAC_IP_HINTS_REFRESHED >= 30)); then
+        MAC_IP_HINTS=()
+        if [[ -r "$MAC_IP_DB" ]]; then
+            while IFS=$'\t' read -r hint_mac hint_ip hint_seen; do
+                is_device_mac "$hint_mac" || continue
+                [[ "$hint_seen" =~ ^[0-9]{1,11}$ ]] || continue
+                [[ "$hint_ip" =~ ^[0-9a-fA-F:.]+$ ]] || continue
+                hint_seen=$((10#$hint_seen))
+                ((hint_seen <= hint_now && hint_now - hint_seen <= hint_ttl)) || continue
+                if ((hint_seen >= ${latest[$hint_mac]:-0})); then
+                    latest["$hint_mac"]="$hint_seen"
+                    MAC_IP_HINTS["$hint_mac"]="$hint_ip (cached)"
+                fi
+            done < "$MAC_IP_DB"
+        fi
+        MAC_IP_HINTS_LOADED=1
+        MAC_IP_HINTS_REFRESHED=$hint_now
     fi
-
-    ensure_mac_ip_db
-    ip_out=$(awk -F'\t' -v m="$mac_norm" '$1==m {print $2; exit}' "$MAC_IP_DB")
-    echo "$ip_out"
-}
-
-update_mac_ip_db_from_scan_rows() {
-    local rows_file="$1"
-    local db_tmp=""
-
-    [ -f "$rows_file" ] || return 0
-    ensure_mac_ip_db
-    db_tmp=$(mktemp)
-
-    awk -F'\t' '
-        BEGIN { OFS="\t" }
-        FILENAME == ARGV[1] {
-            mac = tolower($1)
-            ip = $2
-            if (mac ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/ && ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
-                map[mac] = ip
-            }
-            next
-        }
-        {
-            ip = $1
-            mac = tolower($3)
-            if (mac ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/ && ip ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/) {
-                map[mac] = ip
-            }
-        }
-        END {
-            for (m in map) {
-                print m, map[m]
-            }
-        }
-    ' "$MAC_IP_DB" "$rows_file" | sort -u > "$db_tmp"
-
-    mv "$db_tmp" "$MAC_IP_DB"
-}
-
-upsert_mac_ip_db_pair() {
-    local ip="$1"
-    local mac_in="$2"
-    local mac_norm=""
-    local one_row_tmp=""
-
-    mac_norm=$(normalize_mac "$mac_in")
-    if [ -z "$mac_norm" ]; then
-        return 0
+    hint_mac=$(normalize_mac "$1") || hint_mac=""
+    [[ -z "$hint_mac" ]] || hint_result="${MAC_IP_HINTS[$hint_mac]:-}"
+    if [[ -n "${2:-}" ]]; then
+        printf -v "$2" '%s' "$hint_result"
+    else
+        printf '%s\n' "$hint_result"
     fi
-    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        return 0
-    fi
-
-    one_row_tmp=$(mktemp)
-    printf "%s\tunknown\t%s\tunknown\tn/a\n" "$ip" "$mac_norm" > "$one_row_tmp"
-    update_mac_ip_db_from_scan_rows "$one_row_tmp"
-    rm -f "$one_row_tmp"
 }
 
 log_ok() {
@@ -318,13 +288,22 @@ ensure_sudo_session() {
     return 1
 }
 
+connect_wifi_bssid() {
+    local interface="$1" bssid="$2" password="${3:-}"
+    local -a privilege=() arguments=(--wait 20 device wifi connect "$bssid" ifname "$interface")
+    ensure_sudo_session || return 1
+    [[ "$EUID" -eq 0 ]] || privilege=(sudo)
+    [[ -z "$password" ]] || arguments+=(password "$password")
+    "${privilege[@]}" nmcli "${arguments[@]}"
+}
+
 show_interfaces() {
     local iw_cmd=""
     local ethtool_cmd=""
     local -a ethernet_ifaces=()
     local ifname=""
 
-    if command -v iw >/dev/null 2>&1; then
+    if command -v iw > /dev/null 2>&1; then
         iw_cmd=$(command -v iw)
     elif [ -x /usr/sbin/iw ]; then
         iw_cmd="/usr/sbin/iw"
@@ -335,7 +314,7 @@ show_interfaces() {
     elif [ -x /bin/iw ]; then
         iw_cmd="/bin/iw"
     fi
-    if command -v ethtool >/dev/null 2>&1; then
+    if command -v ethtool > /dev/null 2>&1; then
         ethtool_cmd=$(command -v ethtool)
     fi
     mapfile -t ethernet_ifaces < <(ip -j link show | jq -r '.[].ifname' | grep -E '^(en|eth)' || true)
@@ -346,7 +325,7 @@ show_interfaces() {
     echo ""
     echo "Local Network Interfaces:"
     echo "----------------------------------------------------------------------------------------------------------------"
-    
+
     (
         declare -A gateway_map
         while read -r dev gw; do
@@ -372,14 +351,14 @@ show_interfaces() {
 
         printf "Interface Status IP_Address MAC_Address MTU DHCP Gateway\n"
         ip -j addr show | jq -r '.[] | 
-            "\(.ifname) \(.operstate) \((.addr_info[]? | select(.family == "inet") | "\(.local)/\(.prefixlen)") // "N/A") \(.address) \(.mtu) \((.addr_info[]? | select(.family == "inet") | .dynamic) // false)"' | \
-        while read -r name state ip mac mtu dynamic; do
-            is_dynamic="No"
-            gateway="${gateway_map[$name]:-N/A}"
-            if [ "$dynamic" == "true" ]; then is_dynamic="Yes"; fi
-            if [ "$ip" == "N/A" ]; then is_dynamic="N/A"; fi
-            printf "%s %s %s %s %s %s %s\n" "$name" "$state" "$ip" "$mac" "$mtu" "$is_dynamic" "$gateway"
-        done
+            "\(.ifname) \(.operstate) \((.addr_info[]? | select(.family == "inet") | "\(.local)/\(.prefixlen)") // "N/A") \(.address) \(.mtu) \((.addr_info[]? | select(.family == "inet") | .dynamic) // false)"' |
+            while read -r name state ip mac mtu dynamic; do
+                is_dynamic="No"
+                gateway="${gateway_map[$name]:-N/A}"
+                if [ "$dynamic" == "true" ]; then is_dynamic="Yes"; fi
+                if [ "$ip" == "N/A" ]; then is_dynamic="N/A"; fi
+                printf "%s %s %s %s %s %s %s\n" "$name" "$state" "$ip" "$mac" "$mtu" "$is_dynamic" "$gateway"
+            done
     ) | column -t
     echo "----------------------------------------------------------------------------------------------------------------"
     echo ""
@@ -398,7 +377,7 @@ show_interfaces() {
     echo ""
     echo "lspci -knn | grep -iA2 net"
     echo "----------------------------------------------------------------------------------------------------------------"
-    if command -v lspci >/dev/null 2>&1; then
+    if command -v lspci > /dev/null 2>&1; then
         lspci -knn | grep -iA2 net || echo "No PCI network controllers matched."
     else
         echo "lspci: command not found"
@@ -456,6 +435,7 @@ bssid_scan_realtime() {
     local INTERFACE="$1"
     local DURATION_ARG="$2"
     local TARGET_CHAN="$3"
+    local TARGET_FREQ="$4"
     local DURATION=0
     local finite_mode=0
     local duration_label="forever"
@@ -470,27 +450,40 @@ bssid_scan_realtime() {
     local CAPTURE_IF="mon0"
     local hotspot_err=""
     local channel_hop_pid=""
+    local freq_guard_pid=""
     local prev_conn_uuid=""
     local reconnect_ok=0
     local reconnect_conn=""
     local device_state=""
-    local poll_i=0
+    local _poll_i=0
     local scan_interrupted=0
     local monitor_cleanup_done=0
     local found_stale=0
     local dummy_uuid=""
     local dummy_name=""
     local phy_name=""
-    local hop_channel=""
+    local hop_freq=""
     local tshark_pid=""
     local pkt_file=""
+    local tshark_err=""
+    local frame=""
+    local tune_err=""
+    local restart_note=""
+    local hop_dwell_s="0.15"
+    local hop_dwell_ms=150
+    local stale_window_ms=12000
+    local render_fd=1
+    local ui_use_tty=0
+    local ui_alt_screen_active=0
     local -a PRIV_CMD
-    local -a hop_channels
+    local -a hop_freqs
+    local -a preferred_hop_freqs
+    local -a filtered_hop_freqs
 
     if [ -n "$DURATION_ARG" ]; then
         if ! [[ "$DURATION_ARG" =~ ^[0-9]+$ ]] || [ "$DURATION_ARG" -le 0 ]; then
             echo "Error: duration must be a positive integer (seconds)."
-            echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>]"
+            echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>] [--freq <mhz>]"
             return 1
         fi
         DURATION="$DURATION_ARG"
@@ -502,8 +495,12 @@ bssid_scan_realtime() {
         echo "Error: invalid channel value: $TARGET_CHAN"
         return 1
     fi
+    if [ -n "$TARGET_FREQ" ] && ! [[ "$TARGET_FREQ" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid frequency value: $TARGET_FREQ"
+        return 1
+    fi
 
-    if ! command -v tshark >/dev/null 2>&1; then
+    if ! command -v tshark > /dev/null 2>&1; then
         echo "Error: tshark is required for bssid-scan --realtime."
         return 1
     fi
@@ -525,58 +522,60 @@ bssid_scan_realtime() {
         monitor_cleanup_done=1
 
         if [ -n "$channel_hop_pid" ]; then
-            kill "$channel_hop_pid" >/dev/null 2>&1 || true
-            wait "$channel_hop_pid" 2>/dev/null || true
+            kill "$channel_hop_pid" > /dev/null 2>&1 || true
+            wait "$channel_hop_pid" 2> /dev/null || true
             channel_hop_pid=""
         fi
+        if [ -n "$freq_guard_pid" ]; then
+            kill "$freq_guard_pid" > /dev/null 2>&1 || true
+            wait "$freq_guard_pid" 2> /dev/null || true
+            freq_guard_pid=""
+        fi
         if [ -n "$tshark_pid" ]; then
-            kill "$tshark_pid" >/dev/null 2>&1 || true
-            wait "$tshark_pid" 2>/dev/null || true
+            kill "$tshark_pid" > /dev/null 2>&1 || true
+            wait "$tshark_pid" 2> /dev/null || true
             tshark_pid=""
         fi
 
+        if [ "$ui_alt_screen_active" -eq 1 ]; then
+            tput rmcup 1>&"$render_fd" 2> /dev/null || printf "\033[?1049l" 1>&"$render_fd"
+            ui_alt_screen_active=0
+        fi
+
         log_ok "Stopping realtime monitor mode and restoring managed/connected state on ${INTERFACE}..."
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection down "$HOTSPOT_CONN_NAME" >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection down netmgr_dummy >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" del > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection down "$HOTSPOT_CONN_NAME" > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection down netmgr_dummy > /dev/null 2>&1 || true
         while IFS=: read -r dummy_uuid dummy_name; do
             [ -z "$dummy_uuid" ] && continue
-            "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" >/dev/null 2>&1 || true
-        done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
-        "${PRIV_CMD[@]}" nmcli connection delete "$HOTSPOT_CONN_NAME" >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection delete netmgr_dummy >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli device set "$INTERFACE" managed yes >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" ip link set "$INTERFACE" up >/dev/null 2>&1 || true
+            "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" > /dev/null 2>&1 || true
+        done < <(nmcli -t -f UUID,NAME connection show 2> /dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
+        "${PRIV_CMD[@]}" nmcli connection delete "$HOTSPOT_CONN_NAME" > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection delete netmgr_dummy > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli device set "$INTERFACE" managed yes > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" ip link set "$INTERFACE" up > /dev/null 2>&1 || true
 
         reconnect_ok=0
         if [ -n "$prev_conn_uuid" ]; then
-            if "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" >/dev/null 2>&1; then
+            if "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" > /dev/null 2>&1; then
                 reconnect_ok=1
             fi
         fi
         if [ "$reconnect_ok" -eq 0 ]; then
-            if "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" >/dev/null 2>&1; then
+            if "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" > /dev/null 2>&1; then
                 reconnect_ok=1
             fi
         fi
-        if [ "$reconnect_ok" -eq 0 ]; then
-            "${PRIV_CMD[@]}" systemctl restart NetworkManager >/dev/null 2>&1 || true
-            sleep 1
-            if [ -n "$prev_conn_uuid" ] && "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" >/dev/null 2>&1; then
-                reconnect_ok=1
-            elif "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" >/dev/null 2>&1; then
-                reconnect_ok=1
-            fi
-        fi
-        for poll_i in 1 2 3 4 5 6; do
-            reconnect_conn=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null | awk -F: -v dev="$INTERFACE" '$1==dev && $2=="wifi" && $3=="connected" {print $4; exit}')
+        # Never restart NetworkManager globally to recover one scan interface.
+        for _poll_i in 1 2 3 4 5 6; do
+            reconnect_conn=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2> /dev/null | awk -F: -v dev="$INTERFACE" '$1==dev && $2=="wifi" && $3=="connected" {print $4; exit}')
             if [ -n "$reconnect_conn" ]; then
                 reconnect_ok=1
                 break
             fi
             sleep 1
         done
-        device_state=$(nmcli -t -f GENERAL.STATE device show "$INTERFACE" 2>/dev/null | awk -F: '/^GENERAL.STATE:/ {print $2; exit}')
+        device_state=$(nmcli -t -f GENERAL.STATE device show "$INTERFACE" 2> /dev/null | awk -F: '/^GENERAL.STATE:/ {print $2; exit}')
         if [ "$reconnect_ok" -eq 1 ] && [ -n "$reconnect_conn" ]; then
             log_ok "Reconnected ${INTERFACE} to Wi-Fi successfully (${reconnect_conn})."
         elif [ "$reconnect_ok" -eq 1 ]; then
@@ -586,11 +585,12 @@ bssid_scan_realtime() {
         fi
 
         [ -n "$pkt_file" ] && rm -f "$pkt_file"
+        [ -n "$tshark_err" ] && rm -f "$tshark_err"
     }
 
     log_ok "Starting realtime BSSID scan on ${INTERFACE} using monitor mode..."
-    prev_conn_uuid=$(nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$INTERFACE" '$2==dev {print $1; exit}')
-    PHY_NUM=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" info 2>/dev/null | awk '/wiphy/ {print "phy"$2; exit}')
+    prev_conn_uuid=$(nmcli -t -f UUID,DEVICE connection show --active 2> /dev/null | awk -F: -v dev="$INTERFACE" '$2==dev {print $1; exit}')
+    PHY_NUM=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" info 2> /dev/null | awk '/wiphy/ {print "phy"$2; exit}')
     if [ -z "$PHY_NUM" ]; then
         echo "Error: could not determine phy for interface ${INTERFACE}."
         return 1
@@ -601,50 +601,106 @@ bssid_scan_realtime() {
     if "${PRIV_CMD[@]}" iw dev | grep -qE '^[[:space:]]*Interface[[:space:]]+mon0$'; then
         found_stale=1
         log_ok "Preflight: deleting existing mon0."
-        "${PRIV_CMD[@]}" ip link set mon0 down >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" ip link set "$CAPTURE_IF" down > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" del > /dev/null 2>&1 || true
     fi
     while IFS=: read -r dummy_uuid dummy_name; do
         [ -z "$dummy_uuid" ] && continue
         found_stale=1
         log_ok "Preflight: deleting existing hotspot profile ${dummy_name} (uuid: $dummy_uuid)."
-        "${PRIV_CMD[@]}" nmcli connection down uuid "$dummy_uuid" >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" >/dev/null 2>&1 || true
-    done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
+        "${PRIV_CMD[@]}" nmcli connection down uuid "$dummy_uuid" > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" > /dev/null 2>&1 || true
+    done < <(nmcli -t -f UUID,NAME connection show 2> /dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
     if [ "$found_stale" -eq 0 ]; then
         log_ok "Preflight: no stale mon0/Netmgr_Awake/netmgr_dummy resources found."
     fi
 
-    log_ok "Creating monitor interface mon0 on ${PHY_NUM}..."
-    if ! "${PRIV_CMD[@]}" iw phy "$PHY_NUM" interface add mon0 type monitor; then
-        echo "Error: failed to create mon0 on ${PHY_NUM}."
-        return 1
-    fi
-    if ! "${PRIV_CMD[@]}" ip link set mon0 up; then
-        echo "Error: failed to set mon0 up."
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
-        return 1
-    fi
-    if ! "${PRIV_CMD[@]}" iw dev | grep -qE '^[[:space:]]*Interface[[:space:]]+mon0$'; then
-        echo "Error: mon0 interface was not created successfully."
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
-        return 1
-    fi
-    "${PRIV_CMD[@]}" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+    # Stop NetworkManager from retuning or reclaiming the managed interface while mon0 captures.
+    # This materially improves monitor-mode reliability on mt7921e/mt7922-class cards.
+    "${PRIV_CMD[@]}" nmcli device disconnect "$INTERFACE" > /dev/null 2>&1 || true
+    "${PRIV_CMD[@]}" nmcli device set "$INTERFACE" managed no > /dev/null 2>&1 || true
+    "${PRIV_CMD[@]}" ip link set "$INTERFACE" down > /dev/null 2>&1 || true
 
-    phy_name=$("${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" info 2>/dev/null | awk '/wiphy/ {print "phy"$2; exit}')
+    log_ok "Creating monitor interface mon0 on ${PHY_NUM}..."
+    if ! "${PRIV_CMD[@]}" iw phy "$PHY_NUM" interface add "$CAPTURE_IF" type monitor; then
+        echo "Error: failed to create ${CAPTURE_IF} on ${PHY_NUM}."
+        monitor_cleanup
+        return 1
+    fi
+    if ! "${PRIV_CMD[@]}" ip link set "$CAPTURE_IF" up; then
+        echo "Error: failed to set ${CAPTURE_IF} up."
+        monitor_cleanup
+        return 1
+    fi
+    if ! "${PRIV_CMD[@]}" iw dev | grep -qE "^[[:space:]]*Interface[[:space:]]+${CAPTURE_IF}$"; then
+        echo "Error: ${CAPTURE_IF} interface was not created successfully."
+        monitor_cleanup
+        return 1
+    fi
+    phy_name=$("${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" info 2> /dev/null | awk '/wiphy/ {print "phy"$2; exit}')
     if [ -n "$phy_name" ]; then
-        mapfile -t hop_channels < <("${PRIV_CMD[@]}" iw phy "$phy_name" info 2>/dev/null | awk '
+        mapfile -t hop_freqs < <("${PRIV_CMD[@]}" iw phy "$phy_name" info 2> /dev/null | awk '
             /MHz \[/ && $0 !~ /disabled/ {
-                if (match($0, /\[([0-9]+)\]/, m)) print m[1]
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "MHz" && (i - 1) >= 1 && $(i - 1) ~ /^[0-9]+(\.[0-9]+)?$/) {
+                        print int($(i - 1))
+                        break
+                    }
+                }
             }
         ' | sort -n -u)
     fi
-    if [ "${#hop_channels[@]}" -eq 0 ]; then
-        hop_channels=(1 6 11 36 40 44 48 149 153 157 161)
+    if [ -n "${NETMGR_BSSID_SCAN_FREQS:-}" ]; then
+        # User-supplied priority list, e.g. NETMGR_BSSID_SCAN_FREQS="5975 6055 2412".
+        # This is useful when waiting for a known phone hotspot frequency.
+        read -r -a preferred_hop_freqs <<< "${NETMGR_BSSID_SCAN_FREQS}"
+    else
+        preferred_hop_freqs=(
+            # Prioritize the observed RedMagic/6 GHz PSC frequencies first so a phone hotspot
+            # does not wait behind all 2.4 GHz channels in generic hopping mode.
+            5975 6055 6135 6215 6295 6375
+            2412 2417 2422 2427 2432 2437 2442 2447 2452 2457 2462 2467 2472
+            5180 5200 5220 5240
+            5745 5765 5785 5805
+        )
+    fi
+    filtered_hop_freqs=()
+    if [ "${#hop_freqs[@]}" -gt 0 ]; then
+        for hop_freq in "${preferred_hop_freqs[@]}"; do
+            if printf '%s\n' "${hop_freqs[@]}" | grep -qx "$hop_freq"; then
+                filtered_hop_freqs+=("$hop_freq")
+            fi
+        done
+        if [ "${#filtered_hop_freqs[@]}" -ge 3 ]; then
+            hop_freqs=("${filtered_hop_freqs[@]}")
+        fi
+    fi
+    if [ "${#hop_freqs[@]}" -eq 0 ]; then
+        # Safe fallback includes 6 GHz PSC-style frequencies, including the observed RedMagic hotspot at 5975 MHz.
+        hop_freqs=(5975 6055 6135 6215 6295 6375 2412 2437 2462 5180 5200 5220 5240 5745 5765 5785 5805)
     fi
 
-    if [ -n "$TARGET_CHAN" ]; then
+    if [ -n "$TARGET_FREQ" ]; then
+        log_ok "Initializing MediaTek wakeup sequence on frequency ${TARGET_FREQ} MHz..."
+        if [ "$TARGET_FREQ" -ge 2400 ] && [ "$TARGET_FREQ" -lt 2500 ]; then
+            BAND="bg"
+        elif [ "$TARGET_FREQ" -ge 4900 ] && [ "$TARGET_FREQ" -lt 5950 ]; then
+            BAND="a"
+        elif [ "$TARGET_FREQ" -ge 5950 ] && [ "$TARGET_FREQ" -le 7125 ]; then
+            BAND="a"
+        else
+            echo "Error: unsupported Wi-Fi frequency: ${TARGET_FREQ} MHz"
+            monitor_cleanup
+            return 1
+        fi
+        log_ok "Tuning ${CAPTURE_IF} to ${TARGET_FREQ} MHz..."
+        tune_err=$(mktemp)
+        if ! "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set freq "$TARGET_FREQ" 2> "$tune_err"; then
+            log_err "Warning: failed to explicitly set ${CAPTURE_IF} to ${TARGET_FREQ} MHz: $(cat "$tune_err" 2> /dev/null)"
+            log_err "Continuing anyway; the PHY may be controlled by the driver/firmware."
+        fi
+        rm -f "$tune_err"
+    elif [ -n "$TARGET_CHAN" ]; then
         log_ok "Initializing MediaTek wakeup sequence on channel ${TARGET_CHAN}..."
         if [ "$TARGET_CHAN" -le 14 ]; then
             BAND="bg"
@@ -652,33 +708,85 @@ bssid_scan_realtime() {
             BAND="a"
         fi
         log_ok "Igniting dummy hotspot to wake up hardware..."
-        hotspot_err=$("${PRIV_CMD[@]}" nmcli device wifi hotspot ifname "$INTERFACE" con-name "$HOTSPOT_CONN_NAME" ssid "Netmgr_Scan" password "$HOTSPOT_PSK" band "$BAND" channel "$TARGET_CHAN" 2>&1)
-        if [ $? -ne 0 ]; then
+        if ! hotspot_err=$("${PRIV_CMD[@]}" nmcli device wifi hotspot ifname "$INTERFACE" con-name "$HOTSPOT_CONN_NAME" ssid "Netmgr_Scan" password "$HOTSPOT_PSK" band "$BAND" channel "$TARGET_CHAN" 2>&1); then
             log_err "Failed to create dummy hotspot on ${INTERFACE} channel ${TARGET_CHAN}: ${hotspot_err}"
         fi
-        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$TARGET_CHAN" >/dev/null 2>&1 || true
+        tune_err=$(mktemp)
+        if ! "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$TARGET_CHAN" 2> "$tune_err"; then
+            log_err "Warning: failed to explicitly set ${CAPTURE_IF} to channel ${TARGET_CHAN}: $(cat "$tune_err" 2> /dev/null)"
+            log_err "Continuing anyway because the PHY may already be channel-locked by the dummy hotspot."
+        fi
+        rm -f "$tune_err"
         log_ok "Hardware awake and locked to channel ${TARGET_CHAN}."
     fi
 
-    if [ -z "$TARGET_CHAN" ]; then
+    if [ -z "$TARGET_CHAN" ] && [ -z "$TARGET_FREQ" ]; then
+        "${PRIV_CMD[@]}" nmcli device disconnect "$INTERFACE" > /dev/null 2>&1 || true
+        stale_window_ms=$((${#hop_freqs[@]} * hop_dwell_ms * 2))
+        if [ "$stale_window_ms" -lt 5000 ]; then
+            stale_window_ms=5000
+        fi
         log_ok "No fixed channel specified; using channel hopping on ${CAPTURE_IF}."
+        log_ok "Passive monitor mode selected. For near-instant RedMagic/6 GHz hotspot detection, use active mode: netmgr bssid-scan ${INTERFACE} --realtime --active --freq 5975 --ssid '<SSID>'"
+        log_ok "Hop set: ${#hop_freqs[@]} frequencies (~$(awk -v n="${#hop_freqs[@]}" -v d="$hop_dwell_s" 'BEGIN{printf "%.1f", n*d}')s full cycle)."
+        log_ok "Row retention window: ~$(awk -v ms="$stale_window_ms" 'BEGIN{printf "%.1f", ms/1000.0}')s (prevents flicker while hopping)."
         (
             while true; do
-                for hop_channel in "${hop_channels[@]}"; do
-                    "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$hop_channel" >/dev/null 2>&1 || true
-                    sleep 0.35
+                for hop_freq in "${hop_freqs[@]}"; do
+                    "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set freq "$hop_freq" > /dev/null 2>&1 || true
+                    sleep "$hop_dwell_s"
                 done
             done
         ) &
         channel_hop_pid=$!
+    else
+        stale_window_ms=6000
     fi
 
+    if [ -n "$TARGET_FREQ" ]; then
+        tune_err=$(mktemp)
+        if ! "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set freq "$TARGET_FREQ" 2> "$tune_err"; then
+            log_err "Warning: failed to set ${CAPTURE_IF} to ${TARGET_FREQ} MHz before capture: $(cat "$tune_err" 2> /dev/null)"
+        fi
+        rm -f "$tune_err"
+    elif [ -n "$TARGET_CHAN" ]; then
+        tune_err=$(mktemp)
+        if ! "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$TARGET_CHAN" 2> "$tune_err"; then
+            log_err "Warning: failed to set ${CAPTURE_IF} to channel ${TARGET_CHAN} before capture: $(cat "$tune_err" 2> /dev/null)"
+            log_err "Continuing anyway."
+        fi
+        rm -f "$tune_err"
+    else
+        if [ "${#hop_freqs[@]}" -gt 0 ]; then
+            if ! "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set freq "${hop_freqs[0]}" > /dev/null 2>&1; then
+                echo "Warning: failed to set initial monitor frequency ${hop_freqs[0]} on ${CAPTURE_IF}."
+            fi
+        fi
+    fi
+
+    # In fixed-frequency mode, continuously reassert the requested frequency. Some mt7921e/mt7922
+    # firmware/driver combinations can drift back to a default channel after interface creation or
+    # capture startup. This guard makes --freq 5975 behave as a real pinned-frequency capture.
+    if [ -n "$TARGET_FREQ" ]; then
+        (
+            while true; do
+                "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set freq "$TARGET_FREQ" > /dev/null 2>&1 || true
+                sleep 0.20
+            done
+        ) &
+        freq_guard_pid=$!
+    fi
+
+    "${PRIV_CMD[@]}" ip link set "$CAPTURE_IF" up > /dev/null 2>&1 || true
+    sleep 0.2
+
     pkt_file=$(mktemp)
+    tshark_err=$(mktemp)
     "${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" \
         -Y 'wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05' \
-        -T fields -E separator=$'\t' -E occurrence=f \
-        -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal -e wlan_radio.channel -e wlan_radio.frequency \
-        2>/dev/null > "$pkt_file" &
+        -T fields -E separator=$'\t' -E occurrence=a \
+        -e frame.time_epoch -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal -e wlan_radio.channel -e wlan_radio.frequency \
+        2> "$tshark_err" > "$pkt_file" &
     tshark_pid=$!
 
     start_ms=$(date +%s%3N)
@@ -689,109 +797,991 @@ bssid_scan_realtime() {
     fi
     trap 'scan_interrupted=1' INT TERM
 
-    while :; do
-        now_ms=$(date +%s%3N)
-        if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
-            tput cup 0 0 >/dev/null 2>&1 || printf "\033[H"
-            tput ed >/dev/null 2>&1 || printf "\033[2J"
+    if [ -t 1 ]; then
+        ui_use_tty=1
+    elif [ -w /dev/tty ]; then
+        exec {render_fd}> /dev/tty
+        ui_use_tty=1
+    fi
+    if [ "$ui_use_tty" -eq 1 ] && command -v tput > /dev/null 2>&1; then
+        if tput smcup 1>&"$render_fd" 2> /dev/null; then
+            ui_alt_screen_active=1
         else
-            printf "\033[H\033[2J"
+            printf "\033[?1049h" 1>&"$render_fd"
+            ui_alt_screen_active=1
         fi
-        echo "Realtime BSSID scan on ${INTERFACE} via ${CAPTURE_IF} (monitor mode, live refresh 0.5s)..."
-        if [ "$finite_mode" -eq 1 ]; then
-            remaining_s=$(((end_ms - now_ms + 999) / 1000))
-            if [ "$remaining_s" -lt 0 ]; then
-                remaining_s=0
-            fi
-            echo "Time remaining: ${remaining_s}s (Ctrl+C to stop)"
-        else
-            echo "Running continuously (Ctrl+C to stop)"
-        fi
-        echo "--------------------------------------------------------------------------------"
+    elif [ "$ui_use_tty" -eq 1 ]; then
+        printf "\033[?1049h" 1>&"$render_fd"
+        ui_alt_screen_active=1
+    fi
 
+    while :; do
+        stty sane 2> /dev/null || true
+        now_ms=$(date +%s%3N)
+        restart_note=""
+        if [ -n "$tshark_pid" ] && ! kill -0 "$tshark_pid" 2> /dev/null; then
+            restart_note="Warning: tshark exited; restarting capture."
+            if [ -s "$tshark_err" ]; then
+                restart_note="${restart_note}\n$(tail -n 10 "$tshark_err" 2> /dev/null)"
+            fi
+            : > "$tshark_err"
+            "${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" \
+                -Y 'wlan.fc.type_subtype == 0x08 || wlan.fc.type_subtype == 0x05' \
+                -T fields -E separator=$'\t' -E occurrence=a \
+                -e frame.time_epoch -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal -e wlan_radio.channel -e wlan_radio.frequency \
+                2>> "$tshark_err" >> "$pkt_file" &
+            tshark_pid=$!
+        fi
+        local table_rows=""
         if [ -s "$pkt_file" ]; then
-            {
-                printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tSignal_pct\tRSSI_dBm\n"
-                tail -n 4000 "$pkt_file" | awk -F'\t' '
-                    function normalize_mac(m, a, i, out) {
-                        gsub(/-/, ":", m)
-                        m = tolower(m)
-                        n = split(m, a, ":")
-                        if (n != 6) return ""
+            table_rows=$(tail -n 12000 "$pkt_file" | awk -F'\t' -v now_ms="$now_ms" -v stale_ms="$stale_window_ms" '
+                function normalize_mac(m, a, i, out) {
+                    gsub(/-/, ":", m)
+                    m = tolower(m)
+                    n = split(m, a, ":")
+                    if (n != 6) return ""
+                    out = ""
+                    for (i = 1; i <= 6; i++) {
+                        if (a[i] !~ /^[0-9a-f]{1,2}$/) return ""
+                        if (length(a[i]) == 1) a[i] = "0" a[i]
+                        out = out ((i == 1) ? "" : ":") a[i]
+                    }
+                    return out
+                }
+                function maybe_decode_ssid(s,    h, i, b, v, out) {
+                    if (s == "" || s == "<MISSING>") return ""
+                    h = s
+                    sub(/^0x/, "", h)
+                    if (h ~ /^[0-9A-Fa-f]+$/ && (length(h) % 2) == 0) {
                         out = ""
-                        for (i = 1; i <= 6; i++) {
-                            if (a[i] !~ /^[0-9a-f]{1,2}$/) return ""
-                            if (length(a[i]) == 1) a[i] = "0" a[i]
-                            out = out ((i == 1) ? "" : ":") a[i]
+                        for (i = 1; i <= length(h); i += 2) {
+                            b = substr(h, i, 2)
+                            v = strtonum("0x" b)
+                            if (v == 0) continue
+                            out = out sprintf("%c", v)
                         }
-                        return out
+                        if (out != "") return out
                     }
-                    function maybe_decode_ssid(s,    h, i, b, v, out) {
-                        if (s == "" || s == "<MISSING>") return ""
-                        h = s
-                        sub(/^0x/, "", h)
-                        if (h ~ /^[0-9A-Fa-f]+$/ && (length(h) % 2) == 0) {
-                            out = ""
-                            for (i = 1; i <= length(h); i += 2) {
-                                b = substr(h, i, 2)
-                                v = strtonum("0x" b)
-                                if (v == 0) continue
-                                out = out sprintf("%c", v)
-                            }
-                            if (out != "") return out
+                    return s
+                }
+                function last_numeric(raw,    v, parts, n, i, tok) {
+                    v = raw
+                    gsub(/[[:space:]]/, "", v)
+                    n = split(v, parts, ",")
+                    for (i = n; i >= 1; i--) {
+                        tok = parts[i]
+                        if (tok ~ /^-?[0-9]+(\.[0-9]+)?$/) {
+                            return tok + 0
                         }
-                        return s
                     }
-                    function band_for_freq(f, c) {
-                        if (f ~ /^[0-9]+$/) {
-                            if ((f + 0) >= 2400 && (f + 0) < 2500) return "2.4GHz"
-                            if ((f + 0) >= 4900 && (f + 0) < 5950) return "5GHz"
-                            if ((f + 0) >= 5950 && (f + 0) <= 7125) return "6GHz"
+                    return ""
+                }
+                function band_for_freq(f, c) {
+                    if (f ~ /^[0-9]+$/) {
+                        if ((f + 0) >= 2400 && (f + 0) < 2500) return "2.4GHz"
+                        if ((f + 0) >= 4900 && (f + 0) < 5950) return "5GHz"
+                        if ((f + 0) >= 5950 && (f + 0) <= 7125) return "6GHz"
+                    }
+                    if (c ~ /^[0-9]+$/ && (c + 0) >= 1 && (c + 0) <= 14) return "2.4GHz"
+                    if (c ~ /^[0-9]+$/) return "5GHz"
+                    return "?"
+                }
+                {
+                    ts = $1
+                    b = normalize_mac($2)
+                    if (b == "") next
+                    seen_map[b] = 1
+                    ssid = maybe_decode_ssid($3)
+                    rssi = last_numeric($4)
+                    ch = last_numeric($5)
+                    fr = last_numeric($6)
+                    if (ts ~ /^[0-9]+(\.[0-9]+)?$/) {
+                        ts_val = ts + 0
+                        ts_map[b] = ts_val
+                    }
+                    if (ssid != "") ssid_map[b] = ssid
+                    if (ch != "") ch_map[b] = int(ch)
+                    if (fr != "") fr_map[b] = int(fr)
+                    if (rssi != "") rssi_map[b] = int(rssi)
+                }
+                END {
+                    now_s = now_ms / 1000.0
+                    for (b in seen_map) {
+                        ts = (b in ts_map) ? ts_map[b] : 0
+                        age_ms = (ts > 0) ? int((now_s - ts) * 1000.0) : -1
+                        if (age_ms > stale_ms) {
+                            continue
                         }
-                        if (c ~ /^[0-9]+$/ && (c + 0) >= 1 && (c + 0) <= 14) return "2.4GHz"
-                        if (c ~ /^[0-9]+$/) return "5GHz"
-                        return "?"
-                    }
-                    {
-                        b = normalize_mac($1)
-                        if (b == "") next
-                        ssid = maybe_decode_ssid($2)
-                        rssi = $3
-                        ch = $4
-                        fr = $5
-                        if (ssid != "") ssid_map[b] = ssid
-                        if (ch != "") ch_map[b] = ch
-                        if (fr != "") fr_map[b] = fr
-                        if (rssi ~ /^-?[0-9]+$/) rssi_map[b] = rssi + 0
-                    }
-                    END {
-                        for (b in rssi_map) {
-                            s = (b in ssid_map && ssid_map[b] != "") ? ssid_map[b] : "<hidden>"
-                            c = (b in ch_map && ch_map[b] != "") ? ch_map[b] : "?"
-                            f = (b in fr_map && fr_map[b] != "") ? fr_map[b] : "?"
+                        s = (b in ssid_map && ssid_map[b] != "") ? ssid_map[b] : "<hidden>"
+                        c = (b in ch_map && ch_map[b] != "") ? ch_map[b] : "?"
+                        f = (b in fr_map && fr_map[b] != "") ? fr_map[b] : "?"
+                        if (b in rssi_map) {
                             r = rssi_map[b]
                             p = int((r + 100) * 2)
                             if (p < 0) p = 0
                             if (p > 100) p = 100
-                            gsub(/ /, "_", s)
-                            printf "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n", toupper(b), s, c, f, band_for_freq(f, c), p, r, r
+                            sort_r = r
+                        } else {
+                            r = "N/A"
+                            p = 0
+                            sort_r = -999
                         }
+                        gsub(/[\t\r\n[:cntrl:]]+/, " ", s)
+                        if (length(s) > 48) s = substr(s, 1, 45) "..."
+                        age_s = (age_ms >= 0) ? sprintf("%.1f", age_ms / 1000.0) : "?"
+                        printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\n", toupper(b), s, c, f, band_for_freq(f, c), age_s, p, r, sort_r
                     }
-                ' | sort -t $'\t' -k8,8nr -k1,1V | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,$4,$5,$6,$7}'
-            } | column -t -s $'\t' | sed 's/_/ /g'
-        else
-            echo "No monitor frames yet."
+                }
+            ' | sort -t $'\t' -k9,9nr -k1,1V | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,$4,$5,$6,$7,$8}')
         fi
-        echo "--------------------------------------------------------------------------------"
+
+        frame="$(
+            {
+                echo "Realtime BSSID scan on ${INTERFACE} via ${CAPTURE_IF} (monitor mode, live refresh 0.15s)..."
+                if [ -n "$TARGET_FREQ" ]; then
+                    echo "Mode: fixed frequency ${TARGET_FREQ} MHz (guard reasserts every 0.20s)"
+                elif [ -n "$TARGET_CHAN" ]; then
+                    echo "Mode: fixed channel ${TARGET_CHAN}"
+                else
+                    echo "Mode: hopping ${#hop_freqs[@]} freqs; first freqs: $(printf '%s ' "${hop_freqs[@]}" | cut -c1-80)"
+                fi
+                if [ "$finite_mode" -eq 1 ]; then
+                    remaining_s=$(((end_ms - now_ms + 999) / 1000))
+                    if [ "$remaining_s" -lt 0 ]; then
+                        remaining_s=0
+                    fi
+                    echo "Time remaining: ${remaining_s}s (Press 'c' to connect, 'q' or Ctrl+C to stop)"
+                else
+                    echo "Running continuously (Press 'c' to connect, 'q' or Ctrl+C to stop)"
+                fi
+                echo "--------------------------------------------------------------------------------"
+                echo "mon0 exists: $("${PRIV_CMD[@]}" iw dev 2> /dev/null | grep -q "Interface mon0" && echo yes || echo no)"
+                echo "mon0 info:"
+                "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" info 2>&1 | sed 's/^/  /'
+                echo "tshark alive: $([ -n "$tshark_pid" ] && kill -0 "$tshark_pid" 2> /dev/null && echo yes || echo no), pkt bytes: $(wc -c < "$pkt_file" 2> /dev/null || echo 0)"
+                if [ -n "$restart_note" ]; then
+                    echo "--------------------------------------------------------------------------------"
+                    printf "%b\n" "$restart_note"
+                fi
+
+                if [ -n "$table_rows" ]; then
+                    {
+                        printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tAge_s\tSignal_pct\tRSSI_dBm\n"
+                        printf "%s\n" "$table_rows"
+                    } | column -t -s $'\t'
+                else
+                    echo "No monitor frames yet."
+                fi
+                echo "--------------------------------------------------------------------------------"
+            }
+        )"
+
+        if [ "$ui_use_tty" -eq 1 ] && command -v tput > /dev/null 2>&1; then
+            tput cup 0 0 1>&"$render_fd" 2> /dev/null || printf "\033[H" 1>&"$render_fd"
+            tput ed 1>&"$render_fd" 2> /dev/null || printf "\033[2J" 1>&"$render_fd"
+        else
+            printf "\033[H\033[2J" 1>&"$render_fd"
+        fi
+        printf "%s\n" "$frame" 1>&"$render_fd"
 
         if [ "$scan_interrupted" -eq 1 ] || { [ "$finite_mode" -eq 1 ] && [ "$now_ms" -ge "$end_ms" ]; }; then
             break
         fi
-        sleep 0.5
+
+        if read -r -t 0.15 -n 1 key; then
+            if [[ "$key" == "c" || "$key" == "C" ]]; then
+                local -a bssids=()
+                local -a ssids=()
+                local -a channels=()
+                local -a signals=()
+                local -a bands=()
+                while IFS=$'\t' read -r b s c f band _age p _r; do
+                    [ -z "$b" ] && continue
+                    bssids+=("$b")
+                    ssids+=("$s")
+                    channels+=("$c")
+                    signals+=("$p")
+                    bands+=("$band")
+                done < <(printf "%s\n" "$table_rows")
+
+                if [ "${#bssids[@]}" -eq 0 ]; then
+                    echo "No networks available."
+                    sleep 1
+                    continue
+                fi
+
+                printf "\033[H\033[2J"
+                echo "Discovered Wi-Fi Networks (Monitor Mode):"
+                echo "--------------------------------------------------------------------------------"
+                printf "  %-3s  %-18s  %-30s  %-8s  %-6s  %-6s\n" "Num" "BSSID" "SSID" "Band" "Chan" "Signal"
+                echo "--------------------------------------------------------------------------------"
+                for i in "${!bssids[@]}"; do
+                    printf "  %-3s  %-18s  %-30s  %-8s  %-6s  %-6s%%\n" "$((i + 1))" "${bssids[$i]}" "${ssids[$i]}" "${bands[$i]}" "${channels[$i]}" "${signals[$i]}"
+                done
+                echo "--------------------------------------------------------------------------------"
+                echo ""
+                read -r -p "Enter number to connect (1-${#bssids[@]}), or Enter to cancel: " choice
+                if [ -n "$choice" ] && [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#bssids[@]}" ]; then
+                    local selected_idx=$((choice - 1))
+                    local selected_bssid="${bssids[$selected_idx]}"
+                    local selected_ssid="${ssids[$selected_idx]}"
+                    read -r -s -p "Enter Wi-Fi password for ${selected_ssid} (leave empty if open/saved): " wifi_pw
+                    echo ""
+                    echo "Restoring managed mode on ${INTERFACE} before connecting..."
+                    monitor_cleanup
+                    echo "Connecting to ${selected_ssid} (${selected_bssid})..."
+                    connect_wifi_bssid "$INTERFACE" "$selected_bssid" "$wifi_pw"
+                    exit "$?"
+                fi
+            elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+                break
+            fi
+        fi
     done
 
     trap - INT TERM
     monitor_cleanup
+    if [ "$render_fd" -ne 1 ]; then
+        exec {render_fd}>&-
+    fi
+    echo ""
+    if [ "$scan_interrupted" -eq 1 ]; then
+        return 130
+    fi
+    return 0
+}
+
+bssid_scan_active_realtime() {
+    local INTERFACE="$1"
+    local DURATION_ARG="$2"
+    local TARGET_FREQ="$3"
+    local TARGET_SSID="$4"
+    local DURATION=0
+    local finite_mode=0
+    local start_ms=0
+    local now_ms=0
+    local end_ms=0
+    local remaining_s=0
+    local scan_interrupted=0
+    local scan_out=""
+    local scan_err=""
+    local err_text=""
+    local parsed_rows=""
+    local table_rows=""
+    local last_table_rows=""
+    local last_good_ms=0
+    local last_good_age=""
+    local scan_status=""
+    local render_fd=1
+    local ui_use_tty=0
+    local ui_alt_screen_active=0
+    local key=""
+    local frame_file=""
+    local loop_sleep_default=""
+    local loop_sleep=""
+    local -a PRIV_CMD
+    local -a scan_cmd
+    local -a stage_c_freqs
+    local -a known_probe_ssids
+    local scan_cycle=0
+    local full_scan_every="${NETMGR_ACTIVE_FULL_SCAN_EVERY:-6}"
+    local max_probe_ssids="${NETMGR_ACTIVE_SCAN_MAX_SSIDS:-4}"
+    local scan_kind=""
+    local stage_c_freq_string=""
+    local known_ssid=""
+    local ssid_count=0
+    local selected_idx=""
+    local selected_bssid=""
+    local selected_ssid=""
+    local selected_freq=""
+    local selected_profile=""
+    local choice=""
+    local wifi_pw=""
+    local display_ssid=""
+    local rc=0
+
+    if [ -n "$DURATION_ARG" ]; then
+        if ! [[ "$DURATION_ARG" =~ ^[0-9]+$ ]] || [ "$DURATION_ARG" -le 0 ]; then
+            echo "Error: duration must be a positive integer (seconds)."
+            return 1
+        fi
+        DURATION="$DURATION_ARG"
+        finite_mode=1
+    fi
+
+    if [ -n "$TARGET_FREQ" ] && ! [[ "$TARGET_FREQ" =~ ^[0-9]+$ ]]; then
+        echo "Error: invalid frequency value: $TARGET_FREQ"
+        return 1
+    fi
+
+    if ! command -v iw > /dev/null 2>&1; then
+        echo "Error: iw is required for active realtime BSSID scan."
+        return 1
+    fi
+
+    if [ "$EUID" -eq 0 ]; then
+        PRIV_CMD=()
+    else
+        if ! sudo -v; then
+            echo "Error: sudo authentication failed."
+            return 1
+        fi
+        PRIV_CMD=(sudo)
+    fi
+
+    scan_err=$(mktemp)
+    frame_file=$(mktemp)
+    active_cleanup() {
+        if [ "$ui_alt_screen_active" -eq 1 ]; then
+            tput rmcup 1>&"$render_fd" 2> /dev/null || printf "\033[?1049l" 1>&"$render_fd"
+            ui_alt_screen_active=0
+        fi
+        [ -n "$scan_err" ] && rm -f "$scan_err"
+        [ -n "$frame_file" ] && rm -f "$frame_file"
+    }
+
+    seed_link_row() {
+        "${PRIV_CMD[@]}" iw dev "$INTERFACE" link 2> /dev/null | awk '
+            function freq_num(f) { return (f ~ /^[0-9]+(\.[0-9]+)?$/) ? int(f + 0.5) : 0 }
+            function infer_band(f,    n) {
+                n = freq_num(f)
+                if (n >= 2400 && n < 2500) return "2.4GHz"
+                if (n >= 4900 && n < 5950) return "5GHz"
+                if (n >= 5950 && n <= 7125) return "6GHz"
+                return "?"
+            }
+            function infer_channel(f,    n) {
+                n = freq_num(f)
+                if (n == 2484) return 14
+                if (n >= 2412 && n <= 2472) return int((n - 2407) / 5)
+                if (n >= 5000 && n < 5950) return int((n - 5000) / 5)
+                if (n >= 5955 && n <= 7115) return int((n - 5950) / 5)
+                return "?"
+            }
+            /^Connected to[[:space:]]/ {
+                b=$3
+                sub(/\(.*/, "", b)
+                next
+            }
+            /^[[:space:]]*SSID:/ {
+                ssid=$0
+                sub(/^[[:space:]]*SSID:[[:space:]]*/, "", ssid)
+                next
+            }
+            /^[[:space:]]*freq:/ { freq=$2; next }
+            /^[[:space:]]*signal:/ { signal=int($2); next }
+            END {
+                if (b == "") exit
+                if (ssid == "") ssid = "<hidden>"
+                sigpct = 0
+                if (signal ~ /^-?[0-9]+$/) {
+                    sigpct = int((signal + 100) * 2)
+                    if (sigpct < 0) sigpct = 0
+                    if (sigpct > 100) sigpct = 100
+                } else {
+                    signal = "N/A"
+                }
+                gsub(/[\t\r\n[:cntrl:]]+/, " ", ssid)
+                if (length(ssid) > 48) ssid = substr(ssid, 1, 45) "..."
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", toupper(b), ssid, infer_channel(freq), freq, infer_band(freq), "linked", sigpct, signal
+            }
+        '
+    }
+
+    load_known_probe_ssids() {
+        local conn_name=""
+        local conn_ssid=""
+        local seen_key=""
+        local -A seen_ssids=()
+
+        known_probe_ssids=()
+        if [ -n "$TARGET_SSID" ]; then
+            known_probe_ssids+=("$TARGET_SSID")
+            seen_ssids["$TARGET_SSID"]=1
+        fi
+
+        if [ "${NETMGR_ACTIVE_PROBE_SAVED_SSIDS:-1}" = "0" ]; then
+            return 0
+        fi
+
+        if command -v nmcli > /dev/null 2>&1; then
+            while IFS= read -r conn_name; do
+                [ -z "$conn_name" ] && continue
+                conn_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show "$conn_name" 2> /dev/null | head -n 1)
+                [ -z "$conn_ssid" ] && conn_ssid="$conn_name"
+                [ -z "$conn_ssid" ] && continue
+                seen_key="$conn_ssid"
+                if [ -n "${seen_ssids[$seen_key]+x}" ]; then
+                    continue
+                fi
+                known_probe_ssids+=("$conn_ssid")
+                seen_ssids["$seen_key"]=1
+                if [ "${#known_probe_ssids[@]}" -ge "$max_probe_ssids" ]; then
+                    break
+                fi
+            done < <("${PRIV_CMD[@]}" nmcli -t -f NAME,TYPE connection show 2> /dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
+        fi
+    }
+
+    find_wifi_connection_for_ssid() {
+        local target_ssid="$1"
+        local conn_name=""
+        local conn_ssid=""
+
+        [ -z "$target_ssid" ] && return 1
+        [ "$target_ssid" = "<hidden>" ] && return 1
+        command -v nmcli > /dev/null 2>&1 || return 1
+
+        while IFS= read -r conn_name; do
+            [ -z "$conn_name" ] && continue
+            conn_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show "$conn_name" 2> /dev/null | head -n 1)
+            [ -z "$conn_ssid" ] && conn_ssid="$conn_name"
+            if [ "$conn_ssid" = "$target_ssid" ] || [ "$conn_name" = "$target_ssid" ]; then
+                printf "%s\n" "$conn_name"
+                return 0
+            fi
+        done < <("${PRIV_CMD[@]}" nmcli -t -f NAME,TYPE connection show 2> /dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
+        return 1
+    }
+
+    connect_selected_active_bssid() {
+        local conn_bssid="$1"
+        local conn_ssid="$2"
+        local _conn_freq="$3"
+        local conn_pw="$4"
+        local conn_profile=""
+        local nm_rescan_err=""
+        local connect_err=""
+        local rc=1
+
+        if ! command -v nmcli > /dev/null 2>&1; then
+            echo "Error: nmcli is required to connect from realtime scan results."
+            return 1
+        fi
+
+        "${PRIV_CMD[@]}" nmcli radio wifi on > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli device set "$INTERFACE" managed yes > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" ip link set "$INTERFACE" up > /dev/null 2>&1 || true
+
+        conn_profile=$(find_wifi_connection_for_ssid "$conn_ssid" || true)
+
+        # Active iw-scan results are not necessarily present in NetworkManager's AP cache.
+        # With the iwd backend, nmcli does not support the `ssid` rescan option, so use
+        # a plain NM rescan as a best-effort cache refresh and rely primarily on
+        # `nmcli connection up <saved-profile>` for saved networks.
+        nm_rescan_err=$("${PRIV_CMD[@]}" nmcli --wait 5 device wifi rescan ifname "$INTERFACE" 2>&1 || true)
+        sleep 0.5
+
+        connect_err=$(mktemp)
+        if [ -n "$conn_profile" ] && [ -z "$conn_pw" ]; then
+            local profile_ifname=""
+            profile_ifname=$("${PRIV_CMD[@]}" nmcli -g connection.interface-name connection show "$conn_profile" 2> /dev/null | head -n 1)
+            if [ -n "$profile_ifname" ] && [ "$profile_ifname" != "$INTERFACE" ]; then
+                echo "Saved profile '$conn_profile' is pinned to interface '$profile_ifname', not '$INTERFACE'; skipping saved-profile activation." >&2
+                echo "Falling back to direct SSID connect." >&2
+            else
+                echo "Using saved NetworkManager profile: $conn_profile"
+                # Prefer saved profiles over AP-cache/BSSID connects. This works even when
+                # raw iw saw an AP before NetworkManager/KDE imported it into their AP list.
+                if "${PRIV_CMD[@]}" nmcli --wait 20 connection up "$conn_profile" ifname "$INTERFACE" 2> "$connect_err"; then
+                    rm -f "$connect_err"
+                    return 0
+                else
+                    rc=$?
+                fi
+                echo "Saved profile connect failed; falling back to direct SSID/BSSID connect." >&2
+                cat "$connect_err" >&2
+                : > "$connect_err"
+            fi
+        fi
+
+        if [ -n "$conn_ssid" ] && [ "$conn_ssid" != "<hidden>" ]; then
+            # Prefer SSID over BSSID for phone hotspots because their BSSID may be randomized
+            # and because NM may not have imported the exact BSSID from raw iw scan output.
+            if [ -n "$conn_pw" ]; then
+                if "${PRIV_CMD[@]}" nmcli --wait 20 device wifi connect "$conn_ssid" password "$conn_pw" ifname "$INTERFACE" 2> "$connect_err"; then
+                    rm -f "$connect_err"
+                    return 0
+                else
+                    rc=$?
+                fi
+            else
+                if "${PRIV_CMD[@]}" nmcli --wait 20 device wifi connect "$conn_ssid" ifname "$INTERFACE" 2> "$connect_err"; then
+                    rm -f "$connect_err"
+                    return 0
+                else
+                    rc=$?
+                fi
+            fi
+            cat "$connect_err" >&2
+            : > "$connect_err"
+
+            if [ -n "$conn_pw" ]; then
+                echo "Direct SSID connect failed; trying a new profile without changing existing profiles." >&2
+                local auto_uuid="" auto_created=0
+                IFS= read -r auto_uuid < /proc/sys/kernel/random/uuid || auto_uuid=""
+                if [[ -n "$auto_uuid" ]] && "${PRIV_CMD[@]}" nmcli connection add type wifi ifname "$INTERFACE" con-name "netmgr-${conn_ssid}-${auto_uuid}" connection.uuid "$auto_uuid" connection.autoconnect no ssid "$conn_ssid" > /dev/null 2> "$connect_err"; then
+                    auto_created=1
+                fi
+                if [[ "$auto_created" -eq 1 ]] &&
+                    "${PRIV_CMD[@]}" nmcli connection modify uuid "$auto_uuid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$conn_pw" > /dev/null 2>> "$connect_err" &&
+                    "${PRIV_CMD[@]}" nmcli --wait 20 connection up uuid "$auto_uuid" ifname "$INTERFACE" 2>> "$connect_err"; then
+                    rm -f "$connect_err"
+                    return 0
+                else
+                    rc=$?
+                fi
+                [[ "$auto_created" -eq 0 ]] || "${PRIV_CMD[@]}" nmcli connection delete uuid "$auto_uuid" > /dev/null 2>&1 || true
+                cat "$connect_err" >&2
+                : > "$connect_err"
+            fi
+
+            echo "SSID/profile connect failed; trying exact BSSID as a final fallback." >&2
+        fi
+
+        if [ -n "$conn_bssid" ]; then
+            if [ -n "$conn_pw" ]; then
+                "${PRIV_CMD[@]}" nmcli --wait 20 device wifi connect "$conn_bssid" password "$conn_pw" ifname "$INTERFACE" 2> "$connect_err"
+            else
+                "${PRIV_CMD[@]}" nmcli --wait 20 device wifi connect "$conn_bssid" ifname "$INTERFACE" 2> "$connect_err"
+            fi
+            rc=$?
+        fi
+
+        if [ "$rc" -ne 0 ]; then
+            if [ -n "$nm_rescan_err" ]; then
+                echo "NetworkManager directed rescan output:" >&2
+                echo "$nm_rescan_err" >&2
+            fi
+            cat "$connect_err" >&2
+        fi
+        rm -f "$connect_err"
+        return "$rc"
+    }
+
+    render_active_frame() {
+        local body_rows="$1"
+        local note="$2"
+        local cmd_text="$3"
+        local err_note="$4"
+        local frame_now_ms=""
+
+        frame_now_ms=$(date +%s%3N)
+        {
+            echo "Active realtime BSSID scan on ${INTERFACE} (iw scan; live refresh after each completed scan)."
+            if [ -n "$TARGET_FREQ" ]; then
+                echo "Mode: active scan on ${TARGET_FREQ} MHz"
+            else
+                echo "Mode: active all-channel scan"
+            fi
+            if [ -n "$TARGET_SSID" ]; then
+                echo "Directed SSID probe: ${TARGET_SSID}"
+            else
+                echo "Directed SSID probe: none"
+            fi
+            if [ "$finite_mode" -eq 1 ]; then
+                remaining_s=$(((end_ms - frame_now_ms + 999) / 1000))
+                [ "$remaining_s" -lt 0 ] && remaining_s=0
+                echo "Time remaining: ${remaining_s}s (press c to connect, q or Ctrl+C to stop)"
+            else
+                echo "Running continuously (press c to connect, q or Ctrl+C to stop)"
+            fi
+            echo "--------------------------------------------------------------------------------"
+            if [ -n "$cmd_text" ]; then
+                echo "Command: $cmd_text"
+            fi
+            if [ -n "$scan_kind" ]; then
+                echo "Scan stage: $scan_kind"
+            fi
+            if [ -n "$stage_c_freq_string" ] && [ -z "$TARGET_FREQ" ]; then
+                echo "Stage C freqs: $stage_c_freq_string"
+            fi
+            if [ -n "$note" ]; then
+                echo "$note"
+            fi
+            if [ -n "$err_note" ]; then
+                echo "iw scan stderr: $err_note"
+            fi
+            if [ -n "$last_table_rows" ] && [ "$body_rows" = "$last_table_rows" ] && [ "$last_good_ms" -gt 0 ]; then
+                last_good_age=$((frame_now_ms - last_good_ms))
+                if [ "$last_good_age" -lt 0 ]; then
+                    last_good_age=0
+                fi
+                echo "Display: keeping last successful table (${last_good_age} ms old)"
+            fi
+            echo "--------------------------------------------------------------------------------"
+            if [ -n "$body_rows" ]; then
+                {
+                    printf "BSSID\tSSID\tChannel\tFreq_MHz\tBand\tLastSeen\tSignal_pct\tRSSI_dBm\n"
+                    printf "%s\n" "$body_rows" | awk -F'\t' 'BEGIN{OFS="\t"} {s=$2; if (length(s) > 48) s=substr(s,1,45) "..."; print $1,s,$3,$4,$5,$6,$7,$8}'
+                } | column -t -s $'\t'
+            else
+                echo "No APs returned yet."
+            fi
+            echo "--------------------------------------------------------------------------------"
+        } > "$frame_file"
+
+        if [ "$ui_use_tty" -eq 1 ] && command -v tput > /dev/null 2>&1; then
+            tput cup 0 0 1>&"$render_fd" 2> /dev/null || printf "\033[H" 1>&"$render_fd"
+            tput ed 1>&"$render_fd" 2> /dev/null || printf "\033[2J" 1>&"$render_fd"
+        else
+            printf "\033[H\033[2J" 1>&"$render_fd"
+        fi
+        cat "$frame_file" 1>&"$render_fd"
+    }
+
+    log_ok "Starting active realtime BSSID scan on ${INTERFACE}."
+    if [ -n "$TARGET_FREQ" ]; then
+        log_ok "Active scan frequency filter: ${TARGET_FREQ} MHz."
+    fi
+    if [ -n "$TARGET_SSID" ]; then
+        log_ok "Active directed SSID probe: ${TARGET_SSID}"
+    fi
+
+    if [ -n "${NETMGR_ACTIVE_STAGE_C_FREQS:-}" ]; then
+        # shellcheck disable=SC2206
+        stage_c_freqs=(${NETMGR_ACTIVE_STAGE_C_FREQS})
+    else
+        stage_c_freqs=(
+            5975
+            2437 2412 2452 2462
+            6055 6135 6215 6295 6375
+            5180 5200 5220 5240
+            5745 5765 5785 5805
+        )
+    fi
+    stage_c_freq_string="${stage_c_freqs[*]}"
+
+    if ! [[ "$full_scan_every" =~ ^[0-9]+$ ]] || [ "$full_scan_every" -lt 1 ]; then
+        full_scan_every=6
+    fi
+    if ! [[ "$max_probe_ssids" =~ ^[0-9]+$ ]] || [ "$max_probe_ssids" -lt 0 ]; then
+        max_probe_ssids=4
+    fi
+    load_known_probe_ssids
+
+    if [ -z "$TARGET_FREQ" ]; then
+        log_ok "Active realtime will scan Stage C common frequencies first: ${stage_c_freqs[*]}"
+        log_ok "Full all-channel fallback: every ${full_scan_every} successful loop(s)."
+        if [ "${#known_probe_ssids[@]}" -gt 0 ]; then
+            log_ok "Directed probe SSIDs in Stage C: ${known_probe_ssids[*]}"
+        fi
+    fi
+
+    start_ms=$(date +%s%3N)
+    if [ "$finite_mode" -eq 1 ]; then
+        end_ms=$((start_ms + (DURATION * 1000)))
+    else
+        end_ms=0
+    fi
+    trap 'scan_interrupted=1' INT TERM
+
+    if [ -t 1 ]; then
+        ui_use_tty=1
+    elif [ -w /dev/tty ]; then
+        exec {render_fd}> /dev/tty
+        ui_use_tty=1
+    fi
+    if [ "$ui_use_tty" -eq 1 ] && command -v tput > /dev/null 2>&1; then
+        if tput smcup 1>&"$render_fd" 2> /dev/null; then
+            ui_alt_screen_active=1
+        else
+            printf "\033[?1049h" 1>&"$render_fd"
+            ui_alt_screen_active=1
+        fi
+    elif [ "$ui_use_tty" -eq 1 ]; then
+        printf "\033[?1049h" 1>&"$render_fd"
+        ui_alt_screen_active=1
+    fi
+
+    last_table_rows=$(seed_link_row)
+    if [ -n "$last_table_rows" ]; then
+        last_good_ms=$(date +%s%3N)
+        render_active_frame "$last_table_rows" "Seeded current associated BSSID instantly from iw link; starting first scan in the background loop." "" ""
+    else
+        render_active_frame "" "Starting first scan; the first all-channel scan can take a few seconds." "" ""
+    fi
+
+    while :; do
+        now_ms=$(date +%s%3N)
+        : > "$scan_err"
+        scan_cycle=$((scan_cycle + 1))
+        scan_cmd=(iw dev "$INTERFACE" scan)
+        scan_kind=""
+        if [ -n "$TARGET_FREQ" ]; then
+            scan_cmd+=(freq "$TARGET_FREQ")
+            scan_kind="pinned frequency ${TARGET_FREQ} MHz"
+        else
+            if [ "$full_scan_every" -gt 0 ] && [ $((scan_cycle % full_scan_every)) -eq 0 ]; then
+                scan_kind="full all-channel fallback"
+            else
+                scan_cmd+=(freq "${stage_c_freqs[@]}")
+                scan_kind="Stage C common-frequency scan"
+            fi
+        fi
+        if [ -n "$TARGET_SSID" ]; then
+            scan_cmd+=(ssid "$TARGET_SSID")
+        elif [ -z "$TARGET_FREQ" ] && [ "${#known_probe_ssids[@]}" -gt 0 ]; then
+            ssid_count=0
+            for known_ssid in "${known_probe_ssids[@]}"; do
+                [ -z "$known_ssid" ] && continue
+                scan_cmd+=(ssid "$known_ssid")
+                ssid_count=$((ssid_count + 1))
+                if [ "$max_probe_ssids" -gt 0 ] && [ "$ssid_count" -ge "$max_probe_ssids" ]; then
+                    break
+                fi
+            done
+        fi
+
+        scan_out=$("${PRIV_CMD[@]}" "${scan_cmd[@]}" 2> "$scan_err" || true)
+        err_text=$(tr '\n' ' ' < "$scan_err" | cut -c1-220)
+        parsed_rows=$(printf "%s\n" "$scan_out" | awk '
+            function freq_num(f) { return (f ~ /^[0-9]+(\.[0-9]+)?$/) ? int(f + 0.5) : 0 }
+            function infer_band(f,    n) {
+                n = freq_num(f)
+                if (n >= 2400 && n < 2500) return "2.4GHz"
+                if (n >= 4900 && n < 5950) return "5GHz"
+                if (n >= 5950 && n <= 7125) return "6GHz"
+                return "?"
+            }
+            function infer_channel(f, c,    n) {
+                if (c != "?" && c != "") return c
+                n = freq_num(f)
+                if (n == 2484) return 14
+                if (n >= 2412 && n <= 2472) return int((n - 2407) / 5)
+                if (n >= 5000 && n < 5950) return int((n - 5000) / 5)
+                if (n >= 5955 && n <= 7115) return int((n - 5950) / 5)
+                return "?"
+            }
+            function hexval(h,    digits, hi, lo) {
+                digits = "0123456789abcdef"
+                h = tolower(h)
+                hi = index(digits, substr(h, 1, 1)) - 1
+                lo = index(digits, substr(h, 2, 1)) - 1
+                if (hi < 0 || lo < 0) return -1
+                return hi * 16 + lo
+            }
+            function append_codepoint(out, cp) {
+                if (cp <= 0) return out
+                return out sprintf("%c", cp)
+            }
+            function flush_utf8(out, bytes, n,    j, b1, b2, b3, b4, cp) {
+                j = 1
+                while (j <= n) {
+                    b1 = bytes[j]
+                    if (b1 < 128) {
+                        cp = b1
+                        j += 1
+                    } else if (b1 >= 194 && b1 <= 223 && j + 1 <= n) {
+                        b2 = bytes[j + 1]
+                        cp = (b1 % 32) * 64 + (b2 % 64)
+                        j += 2
+                    } else if (b1 >= 224 && b1 <= 239 && j + 2 <= n) {
+                        b2 = bytes[j + 1]
+                        b3 = bytes[j + 2]
+                        cp = (b1 % 16) * 4096 + (b2 % 64) * 64 + (b3 % 64)
+                        j += 3
+                    } else if (b1 >= 240 && b1 <= 244 && j + 3 <= n) {
+                        b2 = bytes[j + 1]
+                        b3 = bytes[j + 2]
+                        b4 = bytes[j + 3]
+                        cp = (b1 % 8) * 262144 + (b2 % 64) * 4096 + (b3 % 64) * 64 + (b4 % 64)
+                        j += 4
+                    } else {
+                        # Malformed UTF-8 byte sequence. Preserve something printable instead of producing mojibake.
+                        cp = 65533
+                        j += 1
+                    }
+                    out = append_codepoint(out, cp)
+                }
+                return out
+            }
+            function decode_iw_ssid(s,    out, i, hx, v, bytes, n) {
+                out = ""
+                i = 1
+                n = 0
+                while (i <= length(s)) {
+                    if (substr(s, i, 2) == "\\x" && substr(s, i + 2, 2) ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) {
+                        hx = substr(s, i + 2, 2)
+                        v = hexval(hx)
+                        if (v >= 0) {
+                            n++
+                            bytes[n] = v
+                        }
+                        i += 4
+                    } else {
+                        if (n > 0) {
+                            out = flush_utf8(out, bytes, n)
+                            delete bytes
+                            n = 0
+                        }
+                        out = out substr(s, i, 1)
+                        i++
+                    }
+                }
+                if (n > 0) out = flush_utf8(out, bytes, n)
+                return out
+            }
+            function emit() {
+                if (b == "") return
+                if (ssid == "") ssid = "<hidden>"
+                # Keep the iw escaped SSID representation here. Bash decodes it after awk so UTF-8 bytes
+                # such as \xe7\xba\xa2 become the correct terminal string instead of awk/mawk mojibake.
+                band = infer_band(freq)
+                out_chan = infer_channel(freq, chan)
+                sigpct = 0
+                if (signal ~ /^-?[0-9]+$/) {
+                    sigpct = int((signal + 100) * 2)
+                    if (sigpct < 0) sigpct = 0
+                    if (sigpct > 100) sigpct = 100
+                }
+                gsub(/[\t\r\n[:cntrl:]]+/, " ", ssid)
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", toupper(b), ssid, out_chan, freq, band, lastseen, sigpct, signal
+            }
+            BEGIN { b=""; ssid=""; freq="?"; chan="?"; signal="N/A"; lastseen="?" }
+            /^BSS[[:space:]]/ {
+                emit()
+                b=$2
+                sub(/\(.*/, "", b)
+                ssid=""; freq="?"; chan="?"; signal="N/A"; lastseen="?"
+                next
+            }
+            /^[[:space:]]*freq:/ { freq=$2; next }
+            /^[[:space:]]*signal:/ { signal=int($2); next }
+            /^[[:space:]]*SSID:/ { ssid=$0; sub(/^[[:space:]]*SSID:[[:space:]]*/, "", ssid); next }
+            /^[[:space:]]*DS Parameter set:[[:space:]]*channel/ { chan=$NF; next }
+            /^[[:space:]]*primary channel:/ { chan=$3; next }
+            /^[[:space:]]*last seen:/ { lastseen=$3 "ms"; next }
+            END { emit() }
+        ' | while IFS=$'\t' read -r row_bssid row_ssid row_chan row_freq row_band row_lastseen row_sigpct row_signal; do
+            [ -z "$row_bssid" ] && continue
+            if [ "$row_ssid" != "<hidden>" ]; then
+                # iw prints non-ASCII SSIDs as C-style byte escapes. Decode them in bash because
+                # awk implementations commonly turn each byte into mojibake Unicode codepoints.
+                row_ssid=$(printf '%b' "$row_ssid" | tr '\t\r\n' '   ')
+            fi
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$row_bssid" "$row_ssid" "$row_chan" "$row_freq" "$row_band" "$row_lastseen" "$row_sigpct" "$row_signal"
+        done | sort -t $'\t' -k8,8nr -k1,1V)
+
+        scan_status=""
+        table_rows="$parsed_rows"
+        if [ -n "$parsed_rows" ]; then
+            last_table_rows="$parsed_rows"
+            last_good_ms="$now_ms"
+            if [ -n "$err_text" ]; then
+                scan_status="Scan returned APs with a warning."
+            else
+                scan_status="Scan completed."
+            fi
+        elif grep -qi 'Device or resource busy\|resource busy\|temporarily unavailable' "$scan_err" 2> /dev/null; then
+            scan_status="Raw iw scan is temporarily busy; this is common while associated/connected."
+            if [ -n "$last_table_rows" ]; then
+                table_rows="$last_table_rows"
+            fi
+        elif [ -n "$err_text" ]; then
+            scan_status="Scan returned no APs."
+            if [ -n "$last_table_rows" ]; then
+                table_rows="$last_table_rows"
+            fi
+        else
+            scan_status="Scan completed but returned no APs."
+            if [ -n "$last_table_rows" ]; then
+                table_rows="$last_table_rows"
+            fi
+        fi
+
+        render_active_frame "$table_rows" "$scan_status" "${PRIV_CMD[*]} ${scan_cmd[*]}" "$err_text"
+
+        if [ "$scan_interrupted" -eq 1 ] || { [ "$finite_mode" -eq 1 ] && [ "$now_ms" -ge "$end_ms" ]; }; then
+            break
+        fi
+        if read -r -t 0.10 -n 1 key; then
+            if [[ "$key" == "c" || "$key" == "C" ]]; then
+                local -a bssids=()
+                local -a ssids=()
+                local -a channels=()
+                local -a freqs=()
+                local -a signals=()
+                local -a bands=()
+                while IFS=$'\t' read -r b s c f band _lastseen p _r; do
+                    [ -z "$b" ] && continue
+                    bssids+=("$b")
+                    ssids+=("$s")
+                    channels+=("$c")
+                    freqs+=("$f")
+                    bands+=("$band")
+                    signals+=("$p")
+                done < <(printf "%s\n" "$table_rows")
+
+                if [ "${#bssids[@]}" -eq 0 ]; then
+                    render_active_frame "$table_rows" "No networks available to connect to yet." "${PRIV_CMD[*]} ${scan_cmd[*]}" ""
+                    sleep 1
+                    continue
+                fi
+
+                printf "\033[H\033[2J" 1>&"$render_fd"
+                echo "Discovered Wi-Fi Networks:" 1>&"$render_fd"
+                echo "--------------------------------------------------------------------------------" 1>&"$render_fd"
+                printf "  %-3s  %-18s  %-30s  %-8s  %-8s  %-6s  %-6s\n" "Num" "BSSID" "SSID" "Band" "Freq" "Chan" "Signal" 1>&"$render_fd"
+                echo "--------------------------------------------------------------------------------" 1>&"$render_fd"
+                for i in "${!bssids[@]}"; do
+                    display_ssid="${ssids[$i]}"
+                    if [ "${#display_ssid}" -gt 30 ]; then
+                        display_ssid="${display_ssid:0:27}..."
+                    fi
+                    printf "  %-3s  %-18s  %-30s  %-8s  %-8s  %-6s  %-6s%%\n" "$((i + 1))" "${bssids[$i]}" "$display_ssid" "${bands[$i]}" "${freqs[$i]}" "${channels[$i]}" "${signals[$i]}" 1>&"$render_fd"
+                done
+                echo "--------------------------------------------------------------------------------" 1>&"$render_fd"
+                echo "" 1>&"$render_fd"
+                read -r -p "Enter number to connect (1-${#bssids[@]}), or Enter to cancel: " choice
+                if [ -n "$choice" ] && [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#bssids[@]}" ]; then
+                    selected_idx=$((choice - 1))
+                    selected_bssid="${bssids[$selected_idx]}"
+                    selected_ssid="${ssids[$selected_idx]}"
+                    selected_freq="${freqs[$selected_idx]}"
+                    selected_profile=$(find_wifi_connection_for_ssid "$selected_ssid" || true)
+                    if [ -n "$selected_profile" ]; then
+                        read -r -s -p "Enter Wi-Fi password for ${selected_ssid} (leave empty to use saved profile '${selected_profile}'): " wifi_pw
+                    else
+                        read -r -s -p "Enter Wi-Fi password for ${selected_ssid} (leave empty if open/saved): " wifi_pw
+                    fi
+                    echo ""
+                    active_cleanup
+                    echo "Connecting to ${selected_ssid} (${selected_bssid}, ${selected_freq} MHz)..."
+                    if connect_selected_active_bssid "$selected_bssid" "$selected_ssid" "$selected_freq" "$wifi_pw"; then
+                        exit 0
+                    else
+                        rc=$?
+                        echo "Error: failed to connect to ${selected_ssid} (${selected_bssid})." >&2
+                        exit "$rc"
+                    fi
+                fi
+            elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+                break
+            fi
+        fi
+
+        if [ -n "$TARGET_FREQ" ] || [ -n "$TARGET_SSID" ]; then
+            loop_sleep_default="0.20"
+        elif [ "$scan_kind" = "full all-channel fallback" ]; then
+            loop_sleep_default="0.80"
+        else
+            # Stage C scans are restricted to common/high-value frequencies, so retry them faster than a full scan.
+            loop_sleep_default="0.25"
+        fi
+        if grep -qi 'Device or resource busy\|resource busy\|temporarily unavailable' "$scan_err" 2> /dev/null; then
+            loop_sleep="${NETMGR_ACTIVE_SCAN_BUSY_DELAY:-1.20}"
+        else
+            loop_sleep="${NETMGR_ACTIVE_SCAN_DELAY:-$loop_sleep_default}"
+        fi
+        sleep "$loop_sleep"
+    done
+
+    trap - INT TERM
+    active_cleanup
+    if [ "$render_fd" -ne 1 ]; then
+        exec {render_fd}>&-
+    fi
     echo ""
     if [ "$scan_interrupted" -eq 1 ]; then
         return 130
@@ -800,10 +1790,14 @@ bssid_scan_realtime() {
 }
 
 bssid_scan() {
-    local INTERFACE="wlp8s0"
+    local INTERFACE=""
     local DURATION_ARG=""
     local REALTIME=0
     local TARGET_CHAN=""
+    local TARGET_FREQ=""
+    local TARGET_SSID=""
+    local ACTIVE_SCAN=0
+    local PASSIVE_MONITOR=0
     local arg=""
     local DURATION=0
     local duration_label="forever"
@@ -823,14 +1817,39 @@ bssid_scan() {
             --realtime)
                 REALTIME=1
                 ;;
+            --active)
+                ACTIVE_SCAN=1
+                ;;
+            --passive | --monitor | --passive-monitor)
+                PASSIVE_MONITOR=1
+                ;;
+            --ssid)
+                shift
+                if [ -z "${1:-}" ]; then
+                    echo "Error: --ssid requires a value."
+                    echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--active|--passive] [--ssid <ssid>] [--channel <n>] [--freq <mhz>]"
+                    return 1
+                fi
+                TARGET_SSID="$1"
+                ACTIVE_SCAN=1
+                ;;
             --channel)
                 shift
                 if [ -z "${1:-}" ]; then
                     echo "Error: --channel requires a value."
-                    echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>]"
+                    echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>] [--freq <mhz>]"
                     return 1
                 fi
                 TARGET_CHAN="$1"
+                ;;
+            --freq)
+                shift
+                if [ -z "${1:-}" ]; then
+                    echo "Error: --freq requires a value."
+                    echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>] [--freq <mhz>]"
+                    return 1
+                fi
+                TARGET_FREQ="$1"
                 ;;
             *)
                 if [[ "$arg" =~ ^(en|eth|wl|v|do|lo)[0-9a-z]*$ ]]; then
@@ -843,15 +1862,44 @@ bssid_scan() {
         shift
     done
 
+    if [ -z "$INTERFACE" ]; then
+        INTERFACE=$(iw dev 2> /dev/null | awk '/Interface/ {print $2; exit}')
+    fi
+    if [ -z "$INTERFACE" ]; then
+        INTERFACE=$(nmcli -t -f DEVICE,TYPE device status 2> /dev/null | awk -F: '$2=="wifi" {print $1; exit}')
+    fi
+    if [ -z "$INTERFACE" ]; then
+        echo "Error: could not auto-detect Wi-Fi interface. Pass it explicitly, e.g. netmgr bssid-scan wlan0 --realtime --freq 5975"
+        return 1
+    fi
+
+    # A fixed channel is a monitor-mode concept unless the caller also supplies
+    # a frequency. Keep explicit --channel behaviour compatible with old netmgr.
+    if [ -n "$TARGET_CHAN" ] && [ -z "$TARGET_FREQ" ] && [ "$ACTIVE_SCAN" -eq 0 ]; then
+        PASSIVE_MONITOR=1
+    fi
+
     if [ "$REALTIME" -eq 1 ]; then
-        bssid_scan_realtime "$INTERFACE" "$DURATION_ARG" "$TARGET_CHAN"
+        # Default realtime mode is now active scanning, because passive monitor-mode
+        # hopping is not reliable on all MediaTek/6 GHz setups. Use --passive,
+        # --monitor, or --passive-monitor for the old tshark/mon0 RF-sniffing mode.
+        if [ "$PASSIVE_MONITOR" -eq 0 ]; then
+            bssid_scan_active_realtime "$INTERFACE" "$DURATION_ARG" "$TARGET_FREQ" "$TARGET_SSID"
+            return $?
+        fi
+        bssid_scan_realtime "$INTERFACE" "$DURATION_ARG" "$TARGET_CHAN" "$TARGET_FREQ"
         return $?
+    fi
+
+    if [ -n "$TARGET_FREQ" ]; then
+        echo "Error: --freq is only supported with --realtime."
+        return 1
     fi
 
     if [ -n "$DURATION_ARG" ]; then
         if ! [[ "$DURATION_ARG" =~ ^[0-9]+$ ]] || [ "$DURATION_ARG" -le 0 ]; then
             echo "Error: duration must be a positive integer (seconds)."
-            echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>]"
+            echo "Usage: netmgr bssid-scan [interface] [seconds] [--realtime] [--channel <n>] [--freq <mhz>]"
             return 1
         fi
         DURATION="$DURATION_ARG"
@@ -859,12 +1907,12 @@ bssid_scan() {
         finite_mode=1
     fi
 
-    if ! command -v nmcli >/dev/null 2>&1; then
+    if ! command -v nmcli > /dev/null 2>&1; then
         echo "Error: nmcli is required for bssid-scan."
         return 1
     fi
 
-    if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
+    if ! ip link show "$INTERFACE" > /dev/null 2>&1; then
         echo "Error: interface not found: $INTERFACE"
         return 1
     fi
@@ -879,13 +1927,14 @@ bssid_scan() {
     trap 'scan_interrupted=1' INT TERM
 
     while :; do
+        stty sane 2> /dev/null || true
         now_ms=$(date +%s%3N)
         if [ "$now_ms" -ge "$next_rescan_ms" ]; then
-            nmcli dev wifi rescan ifname "$INTERFACE" >/dev/null 2>&1 || true
+            nmcli dev wifi rescan ifname "$INTERFACE" > /dev/null 2>&1 || true
             next_rescan_ms=$((now_ms + rescan_interval_ms))
         fi
 
-        table_rows=$(nmcli -e no -t -f BSSID,CHAN,FREQ,SIGNAL,SSID dev wifi list --rescan no ifname "$INTERFACE" 2>/dev/null | awk -F: '
+        table_rows=$(nmcli -e no -t -f BSSID,CHAN,FREQ,SIGNAL,SSID dev wifi list --rescan no ifname "$INTERFACE" 2> /dev/null | awk -F: '
         function normalize_mac(m, a, i, out) {
             gsub(/-/, ":", m)
             m = tolower(m)
@@ -965,9 +2014,9 @@ bssid_scan() {
             if [ "$remaining_s" -lt 0 ]; then
                 remaining_s=0
             fi
-            echo "Time remaining: ${remaining_s}s (Ctrl+C to stop)"
+            echo "Time remaining: ${remaining_s}s (Press 'c' to connect, 'q' or Ctrl+C to stop)"
         else
-            echo "Running continuously (Ctrl+C to stop)"
+            echo "Running continuously (Press 'c' to connect, 'q' or Ctrl+C to stop)"
         fi
         echo "--------------------------------------------------------------------------------"
         if [ -n "$table_rows" ]; then
@@ -983,7 +2032,54 @@ bssid_scan() {
         if [ "$scan_interrupted" -eq 1 ] || { [ "$finite_mode" -eq 1 ] && [ "$now_ms" -ge "$end_ms" ]; }; then
             break
         fi
-        sleep 0.5
+
+        if read -r -t 0.5 -n 1 key; then
+            if [[ "$key" == "c" || "$key" == "C" ]]; then
+                local -a bssids=()
+                local -a ssids=()
+                local -a channels=()
+                local -a signals=()
+                local -a bands=()
+                while IFS=$'\t' read -r b s c f band p _r; do
+                    [ -z "$b" ] && continue
+                    bssids+=("$b")
+                    ssids+=("$s")
+                    channels+=("$c")
+                    signals+=("$p")
+                    bands+=("$band")
+                done < <(printf "%s\n" "$table_rows" | sed 's/_/ /g')
+
+                if [ "${#bssids[@]}" -eq 0 ]; then
+                    echo "No networks available."
+                    sleep 1
+                    continue
+                fi
+
+                printf "\033[H\033[2J"
+                echo "Discovered Wi-Fi Networks:"
+                echo "--------------------------------------------------------------------------------"
+                printf "  %-3s  %-18s  %-30s  %-8s  %-6s  %-6s\n" "Num" "BSSID" "SSID" "Band" "Chan" "Signal"
+                echo "--------------------------------------------------------------------------------"
+                for i in "${!bssids[@]}"; do
+                    printf "  %-3s  %-18s  %-30s  %-8s  %-6s  %-6s%%\n" "$((i + 1))" "${bssids[$i]}" "${ssids[$i]}" "${bands[$i]}" "${channels[$i]}" "${signals[$i]}"
+                done
+                echo "--------------------------------------------------------------------------------"
+                echo ""
+                read -r -p "Enter number to connect (1-${#bssids[@]}), or Enter to cancel: " choice
+                if [ -n "$choice" ] && [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#bssids[@]}" ]; then
+                    local selected_idx=$((choice - 1))
+                    local selected_bssid="${bssids[$selected_idx]}"
+                    local selected_ssid="${ssids[$selected_idx]}"
+                    read -r -s -p "Enter Wi-Fi password for ${selected_ssid} (leave empty if open/saved): " wifi_pw
+                    echo ""
+                    echo "Connecting to ${selected_ssid} (${selected_bssid})...."
+                    connect_wifi_bssid "$INTERFACE" "$selected_bssid" "$wifi_pw"
+                    exit "$?"
+                fi
+            elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+                break
+            fi
+        fi
     done
 
     trap - INT TERM
@@ -993,6 +2089,8 @@ bssid_scan() {
     fi
 }
 
+# Capture branches have separate pipeline subshells; dedupe/hint state stays in each loop.
+# shellcheck disable=SC2030,SC2031
 listen_subnet() {
     local INTERFACE="wlp8s0"
     local MODE="managed"
@@ -1012,7 +2110,7 @@ listen_subnet() {
     local auto_channel=""
     local channel_hop_pid=""
     local phy_name=""
-    local hop_channel
+    local hop_freq
     local found_count=0
     local trunc_count=0
     local tmp_found
@@ -1025,14 +2123,16 @@ listen_subnet() {
     local frame_bssid=""
     local sa=""
     local ta=""
-    local da=""
+    local _da=""
     local proto=""
     local packet_proto=""
     local sa_norm=""
     local ta_norm=""
-    local da_norm=""
     local maybe_mac=""
     local ip_for_mac=""
+    local local_cidr="" local_pair="" source_is_local=0
+    local -a local_cidrs=()
+    local -A local_mac_ips=()
     local bssid_key=""
     local ssid_value=""
     local display_bssid=""
@@ -1054,10 +2154,10 @@ listen_subnet() {
     local HOTSPOT_PSK="hunter22"
     local hotspot_err=""
     local reconnect_conn=""
-    local poll_i=0
+    local _poll_i=0
     local -a PRIV_CMD
     local -a sniff_cmd
-    local -a hop_channels
+    local -a hop_freqs
     local -a tshark_dec_opts
     declare -A seen_devices
     declare -A VENDOR_CACHE
@@ -1066,7 +2166,7 @@ listen_subnet() {
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            managed|monitor)
+            managed | monitor)
                 MODE="$1"
                 ;;
             --dedupe)
@@ -1117,8 +2217,8 @@ listen_subnet() {
         bssid_lc=$(echo "$BSSID" | tr '[:upper:]' '[:lower:]')
         BSSID=$(echo "$BSSID" | tr '[:lower:]' '[:upper:]')
         if [ -z "$TARGET_CHAN" ]; then
-            nmcli dev wifi rescan ifname "$INTERFACE" >/dev/null 2>&1 || true
-            bssid_channel=$(nmcli -e no -t -f BSSID,CHAN dev wifi list ifname "$INTERFACE" 2>/dev/null | awk -F: -v b="$BSSID" '
+            nmcli dev wifi rescan ifname "$INTERFACE" > /dev/null 2>&1 || true
+            bssid_channel=$(nmcli -e no -t -f BSSID,CHAN dev wifi list ifname "$INTERFACE" 2> /dev/null | awk -F: -v b="$BSSID" '
                 {
                     mac = $1 ":" $2 ":" $3 ":" $4 ":" $5 ":" $6
                     chan = $NF
@@ -1134,7 +2234,7 @@ listen_subnet() {
             fi
         fi
 
-        selected_ssid=$(nmcli -e no -t -f BSSID,SSID dev wifi list ifname "$INTERFACE" 2>/dev/null | awk -F: -v b="$BSSID" '
+        selected_ssid=$(nmcli -e no -t -f BSSID,SSID dev wifi list ifname "$INTERFACE" 2> /dev/null | awk -F: -v b="$BSSID" '
             {
                 mac = toupper($1 ":" $2 ":" $3 ":" $4 ":" $5 ":" $6)
                 if (mac != b) next
@@ -1147,7 +2247,7 @@ listen_subnet() {
     fi
 
     if [ "$MODE" = "monitor" ] && [ -z "$TARGET_CHAN" ] && [ -z "$BSSID" ]; then
-        auto_channel=$(nmcli -e no -t -f IN-USE,CHAN dev wifi list ifname "$INTERFACE" 2>/dev/null | awk -F: '$1=="*" && $2 ~ /^[0-9]+$/ {print $2; exit}')
+        auto_channel=$(nmcli -e no -t -f IN-USE,CHAN dev wifi list ifname "$INTERFACE" 2> /dev/null | awk -F: '$1=="*" && $2 ~ /^[0-9]+$/ {print $2; exit}')
         if [ -n "$auto_channel" ]; then
             TARGET_CHAN="$auto_channel"
             echo "No --channel provided; defaulting to current Wi-Fi channel ${TARGET_CHAN}."
@@ -1165,7 +2265,7 @@ listen_subnet() {
     fi
 
     if [ "$MODE" = "monitor" ] && [ -n "$BSSID" ] && [ -z "$TARGET_CHAN" ]; then
-        bssid_channel=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" scan ap-force 2>/dev/null | awk -v b="$bssid_lc" '
+        bssid_channel=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" scan ap-force 2> /dev/null | awk -v b="$bssid_lc" '
             BEGIN { in_bss = 0 }
             /^BSS / {
                 mac = tolower($2)
@@ -1197,7 +2297,7 @@ listen_subnet() {
             if [[ "$display_chan" =~ ^[0-9]+$ ]]; then
                 BSSID_TO_CHAN["$bssid_key"]="$display_chan"
             fi
-        done < <(nmcli -e no -t -f BSSID,SSID,CHAN dev wifi list ifname "$INTERFACE" 2>/dev/null | awk -F: '
+        done < <(nmcli -e no -t -f BSSID,SSID,CHAN dev wifi list ifname "$INTERFACE" 2> /dev/null | awk -F: '
             {
                 if ($1 ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/ && $2 ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/ && $3 ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/ &&
                     $4 ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/ && $5 ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/ && $6 ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) {
@@ -1213,7 +2313,11 @@ listen_subnet() {
     fi
 
     if [ "$MODE" = "managed" ]; then
-        if command -v tshark >/dev/null 2>&1; then
+        mapfile -t local_cidrs < <(ip -o -4 address show dev "$INTERFACE" 2> /dev/null | awk '{print $4}')
+        while IFS=$'\t' read -r local_pair mac; do
+            [[ -n "$local_pair" && -n "$mac" ]] && local_mac_ips["${mac,,}|$local_pair"]=1
+        done < <(ip -j neigh show dev "$INTERFACE" 2> /dev/null | jq -r '.[] | select(.lladdr != null) | [.dst, .lladdr] | @tsv')
+        if command -v tshark > /dev/null 2>&1; then
             if [ "$DEDUPE" -eq 1 ]; then
                 log_ok "Listening on ${INTERFACE} in managed mode (all traffic, dedupe mode)..."
             else
@@ -1244,32 +2348,43 @@ listen_subnet() {
                     esac
                 done) | while IFS='|' read -r mac ip4 ip6 proto_chain tcp_s tcp_d udp_s udp_d eth_type app_proto; do
                 mac=$(normalize_mac "$mac")
-                if [ -z "$mac" ]; then
-                    continue
+                is_device_mac "$mac" || continue
+                if [ "$DEDUPE" -eq 1 ]; then
+                    [[ -n "${seen_devices[$mac]:-}" ]] && continue
+                    seen_devices[$mac]=1
                 fi
 
-                vendor=$(lookup_vendor "$mac")
+                lookup_vendor "$mac" vendor
                 vendor_disp=$(printf "%.31s" "$vendor")
                 ip_for_mac="$ip4"
                 [ -z "$ip_for_mac" ] && ip_for_mac="$ip6"
-                [ -z "$ip_for_mac" ] && ip_for_mac=$(lookup_ip_from_db "$mac")
-                [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
-                packet_proto=$(format_protocol_stack "$proto_chain" "$tcp_s" "$tcp_d" "$udp_s" "$udp_d" "$eth_type" "$app_proto")
-                if [[ "$INTERFACE" == wlp* ]]; then
-                    packet_proto="${packet_proto//Ethernet/Synthetic Eth}"
+                if [[ -n "$ip_for_mac" ]]; then
+                    source_is_local=0
+                    for local_cidr in "${local_cidrs[@]}"; do
+                        if ipv4_in_cidr "$ip_for_mac" "$local_cidr"; then
+                            source_is_local=1
+                            break
+                        fi
+                    done
+                    if [[ "$source_is_local" -eq 0 && -z "${local_mac_ips[$mac | $ip_for_mac]:-}" ]]; then
+                        ip_for_mac="$ip_for_mac (source; MAC may be next-hop)"
+                    fi
+                else
+                    lookup_ip_from_db "$mac" ip_for_mac
                 fi
+                [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
 
                 if [ "$DEDUPE" -eq 1 ]; then
-                    if [[ -n "${seen_devices[$mac]}" ]]; then
-                        continue
-                    fi
-                    seen_devices[$mac]=1
                     printf "[%s] NEW HOST DETECTED | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp"
-                    sleep 1
                 else
+                    packet_proto=$(format_protocol_stack "$proto_chain" "$tcp_s" "$tcp_d" "$udp_s" "$udp_d" "$eth_type" "$app_proto")
+                    if [[ "$INTERFACE" == wl* ]]; then
+                        packet_proto="${packet_proto//Ethernet/Synthetic Eth}"
+                    fi
                     printf "[%s] %-18s %-39s %-31s %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp" "$packet_proto"
                 fi
             done
+            sniff_rc=${PIPESTATUS[0]}
         else
             if [ "$DEDUPE" -eq 1 ]; then
                 log_ok "Listening on ${INTERFACE} in managed mode (all traffic, dedupe mode)..."
@@ -1301,27 +2416,26 @@ listen_subnet() {
                 done) | while read -r line; do
                 mac=$(echo "$line" | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -n 1)
                 mac=$(normalize_mac "$mac")
-                [ -z "$mac" ] && continue
+                is_device_mac "$mac" || continue
+                if [ "$DEDUPE" -eq 1 ]; then
+                    [[ -n "${seen_devices[$mac]:-}" ]] && continue
+                    seen_devices[$mac]=1
+                fi
 
-                vendor=$(lookup_vendor "$mac")
+                lookup_vendor "$mac" vendor
                 vendor_disp=$(printf "%.31s" "$vendor")
-                ip_for_mac=$(lookup_ip_from_db "$mac")
+                lookup_ip_from_db "$mac" ip_for_mac
                 [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
                 packet_proto="UNKNOWN"
 
                 if [ "$DEDUPE" -eq 1 ]; then
-                    if [[ -n "${seen_devices[$mac]}" ]]; then
-                        continue
-                    fi
-                    seen_devices[$mac]=1
                     printf "[%s] NEW HOST DETECTED | MAC: %-17s | IP: %-15s | Vendor: %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp"
-                    sleep 1
                 else
                     printf "[%s] %-18s %-39s %-31s %s\n" "$(date +%T)" "$mac" "$ip_for_mac" "$vendor_disp" "$packet_proto"
                 fi
             done
+            sniff_rc=${PIPESTATUS[0]}
         fi
-        sniff_rc=${PIPESTATUS[0]}
         if [ "$sniff_rc" -ne 0 ] && [ "$sniff_rc" -ne 130 ]; then
             log_err "Managed capture failed on interface ${INTERFACE}."
             return "$sniff_rc"
@@ -1342,45 +2456,37 @@ listen_subnet() {
         monitor_cleanup_done=1
 
         if [ -n "$channel_hop_pid" ]; then
-            kill "$channel_hop_pid" >/dev/null 2>&1 || true
-            wait "$channel_hop_pid" 2>/dev/null || true
+            kill "$channel_hop_pid" > /dev/null 2>&1 || true
+            wait "$channel_hop_pid" 2> /dev/null || true
         fi
 
         echo ""
         log_ok "Stopping monitor mode and restoring managed/connected state on ${INTERFACE}..."
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection down "$HOTSPOT_CONN_NAME" >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection down netmgr_dummy >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" del > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection down "$HOTSPOT_CONN_NAME" > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection down netmgr_dummy > /dev/null 2>&1 || true
         while IFS=: read -r dummy_uuid dummy_name; do
             [ -z "$dummy_uuid" ] && continue
-            "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" >/dev/null 2>&1 || true
-        done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
-        "${PRIV_CMD[@]}" nmcli connection delete "$HOTSPOT_CONN_NAME" >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection delete netmgr_dummy >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" ip link set "$INTERFACE" up >/dev/null 2>&1 || true
+            "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" > /dev/null 2>&1 || true
+        done < <(nmcli -t -f UUID,NAME connection show 2> /dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
+        "${PRIV_CMD[@]}" nmcli connection delete "$HOTSPOT_CONN_NAME" > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection delete netmgr_dummy > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" ip link set "$INTERFACE" up > /dev/null 2>&1 || true
 
         reconnect_ok=0
         if [ -n "$prev_conn_uuid" ]; then
-            if "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" >/dev/null 2>&1; then
+            if "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" > /dev/null 2>&1; then
                 reconnect_ok=1
             fi
         fi
         if [ "$reconnect_ok" -eq 0 ]; then
-            if "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" >/dev/null 2>&1; then
+            if "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" > /dev/null 2>&1; then
                 reconnect_ok=1
             fi
         fi
-        if [ "$reconnect_ok" -eq 0 ]; then
-            "${PRIV_CMD[@]}" systemctl restart NetworkManager >/dev/null 2>&1 || true
-            sleep 1
-            if [ -n "$prev_conn_uuid" ] && "${PRIV_CMD[@]}" nmcli connection up uuid "$prev_conn_uuid" ifname "$INTERFACE" >/dev/null 2>&1; then
-                reconnect_ok=1
-            elif "${PRIV_CMD[@]}" nmcli device connect "$INTERFACE" >/dev/null 2>&1; then
-                reconnect_ok=1
-            fi
-        fi
-        for poll_i in 1 2 3 4 5 6; do
-            reconnect_conn=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null | awk -F: -v dev="$INTERFACE" '$1==dev && $2=="wifi" && $3=="connected" {print $4; exit}')
+        # Never restart NetworkManager globally to recover one scan interface.
+        for _poll_i in 1 2 3 4 5 6; do
+            reconnect_conn=$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2> /dev/null | awk -F: -v dev="$INTERFACE" '$1==dev && $2=="wifi" && $3=="connected" {print $4; exit}')
             if [ -n "$reconnect_conn" ]; then
                 reconnect_ok=1
                 break
@@ -1388,7 +2494,7 @@ listen_subnet() {
             sleep 1
         done
 
-        device_state=$(nmcli -t -f GENERAL.STATE device show "$INTERFACE" 2>/dev/null | awk -F: '/^GENERAL.STATE:/ {print $2; exit}')
+        device_state=$(nmcli -t -f GENERAL.STATE device show "$INTERFACE" 2> /dev/null | awk -F: '/^GENERAL.STATE:/ {print $2; exit}')
         if [ "$reconnect_ok" -eq 1 ] && [ -n "$reconnect_conn" ]; then
             log_ok "Reconnected ${INTERFACE} to Wi-Fi successfully (${reconnect_conn})."
         elif [ "$reconnect_ok" -eq 1 ]; then
@@ -1399,14 +2505,14 @@ listen_subnet() {
     }
 
     log_ok "Starting monitor mode on ${INTERFACE}..."
-    prev_conn_uuid=$(nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null | awk -F: -v dev="$INTERFACE" '$2==dev {print $1; exit}')
+    prev_conn_uuid=$(nmcli -t -f UUID,DEVICE connection show --active 2> /dev/null | awk -F: -v dev="$INTERFACE" '$2==dev {print $1; exit}')
     if [ -n "$prev_conn_uuid" ]; then
-        decrypt_ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
-        [ -z "$decrypt_ssid" ] && decrypt_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+        decrypt_ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$prev_conn_uuid" 2> /dev/null | head -n 1)
+        [ -z "$decrypt_ssid" ] && decrypt_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show uuid "$prev_conn_uuid" 2> /dev/null | head -n 1)
         for psk_field in 802-11-wireless-security.psk wifi-sec.psk 802-11-wireless-security.sae-password wifi-sec.sae-password; do
-            decrypt_psk=$(nmcli --show-secrets -g "$psk_field" connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+            decrypt_psk=$(nmcli --show-secrets -g "$psk_field" connection show uuid "$prev_conn_uuid" 2> /dev/null | head -n 1)
             if [ -z "$decrypt_psk" ]; then
-                decrypt_psk=$("${PRIV_CMD[@]}" nmcli --show-secrets -g "$psk_field" connection show uuid "$prev_conn_uuid" 2>/dev/null | head -n 1)
+                decrypt_psk=$("${PRIV_CMD[@]}" nmcli --show-secrets -g "$psk_field" connection show uuid "$prev_conn_uuid" 2> /dev/null | head -n 1)
             fi
             [ -n "$decrypt_psk" ] && break
         done
@@ -1417,21 +2523,21 @@ listen_subnet() {
     if [ -z "$decrypt_psk" ] && [ -n "$decrypt_ssid" ]; then
         while read -r decrypt_uuid; do
             [ -z "$decrypt_uuid" ] && continue
-            conn_ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
-            [ -z "$conn_ssid" ] && conn_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+            conn_ssid=$(nmcli -g 802-11-wireless.ssid connection show uuid "$decrypt_uuid" 2> /dev/null | head -n 1)
+            [ -z "$conn_ssid" ] && conn_ssid=$("${PRIV_CMD[@]}" nmcli -g 802-11-wireless.ssid connection show uuid "$decrypt_uuid" 2> /dev/null | head -n 1)
             [ "$conn_ssid" != "$decrypt_ssid" ] && continue
             conn_psk=""
             for psk_field in 802-11-wireless-security.psk wifi-sec.psk 802-11-wireless-security.sae-password wifi-sec.sae-password; do
-                conn_psk=$(nmcli --show-secrets -g "$psk_field" connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+                conn_psk=$(nmcli --show-secrets -g "$psk_field" connection show uuid "$decrypt_uuid" 2> /dev/null | head -n 1)
                 if [ -z "$conn_psk" ]; then
-                    conn_psk=$("${PRIV_CMD[@]}" nmcli --show-secrets -g "$psk_field" connection show uuid "$decrypt_uuid" 2>/dev/null | head -n 1)
+                    conn_psk=$("${PRIV_CMD[@]}" nmcli --show-secrets -g "$psk_field" connection show uuid "$decrypt_uuid" 2> /dev/null | head -n 1)
                 fi
                 [ -n "$conn_psk" ] && break
             done
             [ -z "$conn_psk" ] && continue
             decrypt_psk="$conn_psk"
             break
-        done < <(nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
+        done < <(nmcli -t -f UUID,TYPE connection show 2> /dev/null | awk -F: '$2=="802-11-wireless" {print $1}')
     fi
     tshark_dec_opts=()
     if [ -n "$decrypt_ssid" ] && [ -n "$decrypt_psk" ]; then
@@ -1440,10 +2546,10 @@ listen_subnet() {
     else
         log_err "No saved WPA key available for monitor decryption; protocol may remain 802.11."
     fi
-    if [ "${NETMGR_AIRMON_KILL:-0}" = "1" ] && command -v airmon-ng >/dev/null 2>&1; then
-        "${PRIV_CMD[@]}" airmon-ng check kill >/dev/null 2>&1 || true
+    if [ "${NETMGR_AIRMON_KILL:-0}" = "1" ] && command -v airmon-ng > /dev/null 2>&1; then
+        "${PRIV_CMD[@]}" airmon-ng check kill > /dev/null 2>&1 || true
     fi
-    PHY_NUM=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" info 2>/dev/null | awk '/wiphy/ {print "phy"$2; exit}')
+    PHY_NUM=$("${PRIV_CMD[@]}" iw dev "$INTERFACE" info 2> /dev/null | awk '/wiphy/ {print "phy"$2; exit}')
     if [ -z "$PHY_NUM" ]; then
         echo "Error: could not determine phy for interface ${INTERFACE}."
         return 1
@@ -1454,16 +2560,16 @@ listen_subnet() {
     if "${PRIV_CMD[@]}" iw dev | grep -qE '^[[:space:]]*Interface[[:space:]]+mon0$'; then
         found_stale=1
         log_ok "Preflight: deleting existing mon0."
-        "${PRIV_CMD[@]}" ip link set mon0 down >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" ip link set "$CAPTURE_IF" down > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" del > /dev/null 2>&1 || true
     fi
     while IFS=: read -r dummy_uuid dummy_name; do
         [ -z "$dummy_uuid" ] && continue
         found_stale=1
         log_ok "Preflight: deleting existing hotspot profile ${dummy_name} (uuid: $dummy_uuid)."
-        "${PRIV_CMD[@]}" nmcli connection down uuid "$dummy_uuid" >/dev/null 2>&1 || true
-        "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" >/dev/null 2>&1 || true
-    done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
+        "${PRIV_CMD[@]}" nmcli connection down uuid "$dummy_uuid" > /dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" nmcli connection delete uuid "$dummy_uuid" > /dev/null 2>&1 || true
+    done < <(nmcli -t -f UUID,NAME connection show 2> /dev/null | awk -F: '$2=="netmgr_dummy" || $2=="Netmgr_Awake" {print $1 ":" $2}')
     if [ "$found_stale" -eq 0 ]; then
         log_ok "Preflight: no stale mon0/Netmgr_Awake/netmgr_dummy resources found."
     fi
@@ -1475,27 +2581,29 @@ listen_subnet() {
     fi
     if ! "${PRIV_CMD[@]}" ip link set mon0 up; then
         echo "Error: failed to set mon0 up."
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" del > /dev/null 2>&1 || true
         return 1
     fi
     if ! "${PRIV_CMD[@]}" iw dev | grep -qE '^[[:space:]]*Interface[[:space:]]+mon0$'; then
         echo "Error: mon0 interface was not created successfully."
-        "${PRIV_CMD[@]}" iw dev mon0 del >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" del > /dev/null 2>&1 || true
         return 1
     fi
-    "${PRIV_CMD[@]}" nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+    "${PRIV_CMD[@]}" nmcli device disconnect "$INTERFACE" > /dev/null 2>&1 || true
     CAPTURE_IF="mon0"
 
-    phy_name=$("${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" info 2>/dev/null | awk '/wiphy/ {print "phy"$2; exit}')
+    phy_name=$("${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" info 2> /dev/null | awk '/wiphy/ {print "phy"$2; exit}')
     if [ -n "$phy_name" ]; then
-        mapfile -t hop_channels < <("${PRIV_CMD[@]}" iw phy "$phy_name" info 2>/dev/null | awk '
+        mapfile -t hop_freqs < <("${PRIV_CMD[@]}" iw phy "$phy_name" info 2> /dev/null | awk '
             /MHz \[/ && $0 !~ /disabled/ {
-                if (match($0, /\[([0-9]+)\]/, m)) print m[1]
+                for (i = 1; i < NF; i++) {
+                    if ($i ~ /^[0-9]+$/ && $(i + 1) == "MHz") { print $i; break }
+                }
             }
         ' | sort -n -u)
     fi
-    if [ "${#hop_channels[@]}" -eq 0 ]; then
-        hop_channels=(1 6 11 36 40 44 48 149 153 157 161)
+    if [ "${#hop_freqs[@]}" -eq 0 ]; then
+        hop_freqs=(2412 2437 2462 5180 5200 5220 5240 5745 5765 5785 5805)
     fi
 
     if [ -n "$TARGET_CHAN" ]; then
@@ -1506,11 +2614,10 @@ listen_subnet() {
             BAND="a"
         fi
         log_ok "Igniting dummy hotspot to wake up hardware..."
-        hotspot_err=$("${PRIV_CMD[@]}" nmcli device wifi hotspot ifname "$INTERFACE" con-name "$HOTSPOT_CONN_NAME" ssid "Netmgr_Scan" password "$HOTSPOT_PSK" band "$BAND" channel "$TARGET_CHAN" 2>&1)
-        if [ $? -ne 0 ]; then
+        if ! hotspot_err=$("${PRIV_CMD[@]}" nmcli device wifi hotspot ifname "$INTERFACE" con-name "$HOTSPOT_CONN_NAME" ssid "Netmgr_Scan" password "$HOTSPOT_PSK" band "$BAND" channel "$TARGET_CHAN" 2>&1); then
             log_err "Failed to create dummy hotspot on ${INTERFACE} channel ${TARGET_CHAN}: ${hotspot_err}"
         fi
-        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$TARGET_CHAN" >/dev/null 2>&1 || true
+        "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$TARGET_CHAN" > /dev/null 2>&1 || true
         log_ok "Hardware awake and locked to channel ${TARGET_CHAN}."
     elif [ -n "$BSSID" ]; then
         log_err "Could not determine channel for BSSID ${BSSID}; using channel hopping."
@@ -1520,8 +2627,8 @@ listen_subnet() {
         log_err "No fixed channel resolved; using channel hopping on ${CAPTURE_IF}."
         (
             while true; do
-                for hop_channel in "${hop_channels[@]}"; do
-                    "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set channel "$hop_channel" >/dev/null 2>&1 || true
+                for hop_freq in "${hop_freqs[@]}"; do
+                    "${PRIV_CMD[@]}" iw dev "$CAPTURE_IF" set freq "$hop_freq" > /dev/null 2>&1 || true
                     sleep 0.35
                 done
             done
@@ -1541,12 +2648,11 @@ listen_subnet() {
 
     tmp_found=$(mktemp)
     tmp_trunc=$(mktemp)
-    sniff_cmd=("${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" "${tshark_dec_opts[@]}" -T fields -E separator=$'\t' -E occurrence=f -e wlan.bssid -e wlan.sa -e wlan.ta -e wlan.da -e _ws.col.Protocol)
-    "${sniff_cmd[@]}" 2>/dev/null | while IFS=$'\t' read -r frame_bssid sa ta da proto; do
+    sniff_cmd=("${PRIV_CMD[@]}" tshark -l -n -i "$CAPTURE_IF" "${tshark_dec_opts[@]}" -T fields -E separator='|' -E occurrence=f -e wlan.bssid -e wlan.sa -e wlan.ta -e wlan.da -e _ws.col.Protocol)
+    "${sniff_cmd[@]}" 2> /dev/null | while IFS='|' read -r frame_bssid sa ta _da proto; do
         frame_bssid=$(normalize_mac "$frame_bssid")
         sa_norm=$(normalize_mac "$sa")
         ta_norm=$(normalize_mac "$ta")
-        da_norm=$(normalize_mac "$da")
         packet_proto="$proto"
         [ -z "$packet_proto" ] && packet_proto="802.11"
 
@@ -1562,9 +2668,10 @@ listen_subnet() {
             continue
         fi
 
-        for maybe_mac in "$sa_norm" "$ta_norm" "$da_norm"; do
-            [ -z "$maybe_mac" ] && continue
-            [ "$maybe_mac" = "ff:ff:ff:ff:ff:ff" ] && continue
+        [[ "$ta_norm" == "$sa_norm" ]] && ta_norm=""
+        # A frame addressed to a MAC does not establish that the recipient exists.
+        for maybe_mac in "$sa_norm" "$ta_norm"; do
+            is_device_mac "$maybe_mac" || continue
             if [ -n "$bssid_lc" ] && [ "$maybe_mac" = "$bssid_lc" ]; then
                 continue
             fi
@@ -1577,9 +2684,9 @@ listen_subnet() {
             fi
             echo 1 >> "$tmp_found"
 
-            vendor=$(lookup_vendor "$maybe_mac")
+            lookup_vendor "$maybe_mac" vendor
             vendor_disp=$(printf "%.31s" "$vendor")
-            ip_for_mac=$(lookup_ip_from_db "$maybe_mac")
+            lookup_ip_from_db "$maybe_mac" ip_for_mac
             [ -z "$ip_for_mac" ] && ip_for_mac="n/a"
             display_bssid="$discovered_bssid"
             [ "$display_bssid" = "unknown" ] || display_bssid=$(echo "$display_bssid" | tr '[:lower:]' '[:upper:]')
@@ -1600,8 +2707,8 @@ listen_subnet() {
     done
     sniff_rc=${PIPESTATUS[0]}
     if [ -n "$channel_hop_pid" ]; then
-        kill "$channel_hop_pid" >/dev/null 2>&1 || true
-        wait "$channel_hop_pid" 2>/dev/null || true
+        kill "$channel_hop_pid" > /dev/null 2>&1 || true
+        wait "$channel_hop_pid" 2> /dev/null || true
         channel_hop_pid=""
     fi
     found_count=$(wc -l < "$tmp_found")
@@ -1681,32 +2788,32 @@ get_hop_info() {
     local country=""
     local postal=""
     local org=""
-    
+
     if [[ $ip =~ ^192\.168\. ]] || [[ $ip =~ ^10\. ]] || [[ $ip =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || [[ $ip =~ ^fe80: ]] || [[ $ip =~ ^fd[0-9a-f]{2}: ]] || [[ $ip =~ ^fc[0-9a-f]{2}: ]]; then
         suffix=$(get_local_cidr "$ip")
         netname="Local_Network"
         asn="N/A"
         location="N/A"
     else
-        ip_data=$(curl -s "https://ipinfo.io/$ip")
-        cymru_data=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -n 1)
-        
+        ip_data=$(curl -fsS --connect-timeout 2 --max-time 4 "https://ipinfo.io/$ip" 2> /dev/null)
+        cymru_data=$(timeout 4 whois -h whois.cymru.com " -v $ip" 2> /dev/null | tail -n 1)
+
         raw_range=$(echo "$cymru_data" | awk -F'|' '{print $3}' | xargs)
         if [[ "$ip" != *:* ]]; then
             suffix=$(range_to_suffix "$raw_range")
         fi
-        
+
         city=$(echo "$ip_data" | jq -r '.city // empty' | tr ' ' '_')
         country=$(echo "$ip_data" | jq -r '.country // empty')
         postal=$(echo "$ip_data" | jq -r '.postal // empty')
         org=$(echo "$ip_data" | jq -r '.org // empty')
-        
+
         asn=$(echo "$org" | grep -oP '^AS\d+' || echo "N/A")
         netname=$(echo "$org" | sed -E "s/^AS[0-9]+ //" | tr ' ' '_' || echo "unknown")
-        
+
         location="${country:-??}"
-        if [ -n "$city" ]; then location="$location_($city)"; fi
-        if [ -n "$postal" ]; then location="$location_[$postal]"; fi
+        if [ -n "$city" ]; then location="${location}_($city)"; fi
+        if [ -n "$postal" ]; then location="${location}_[$postal]"; fi
     fi
 
     if [ -z "$netname" ] || [[ "$netname" == "AS Name" ]]; then netname="unknown"; fi
@@ -1745,7 +2852,7 @@ run_traceroute() {
     local diag_v6_addr=""
     local diag_v4_default=""
     local diag_v6_default=""
-    local route_hops_file="/tmp/route-hops.txt"
+    local route_hops_file=""
     local route_hops_raw=""
     local discovery_rounds="${NETMGR_TRACE_DISCOVERY_ROUNDS:-5}"
     local round=1
@@ -1767,7 +2874,7 @@ run_traceroute() {
     local -a resolved_v6=()
 
     if [ $# -ge 1 ]; then
-        if ip link show "$1" >/dev/null 2>&1; then
+        if ip link show "$1" > /dev/null 2>&1; then
             trace_intf="$1"
             if [ $# -ge 2 ]; then
                 input_target="$2"
@@ -1800,9 +2907,9 @@ run_traceroute() {
             log_ok "A candidates: ${resolved_v4[*]}"
         fi
 
-        if command -v curl >/dev/null 2>&1; then
+        if command -v curl > /dev/null 2>&1; then
             for happy_scheme in https http; do
-                curl_out=$(curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --happy-eyeballs-timeout-ms 200 --write-out '%{remote_ip}' "${happy_scheme}://${input_target}" 2>/dev/null | tr -d '\r')
+                curl_out=$(curl -sS -o /dev/null --connect-timeout 3 --max-time 6 --happy-eyeballs-timeout-ms 200 --write-out '%{remote_ip}' "${happy_scheme}://${input_target}" 2> /dev/null | tr -d '\r')
                 if [[ "$curl_out" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$curl_out" == *:* ]]; then
                     happy_ip="$curl_out"
                     break
@@ -1825,7 +2932,7 @@ run_traceroute() {
         fi
 
         for ip_candidate in "${resolved_v4[@]}"; do
-            v4_route_line=$(ip -4 route get "$ip_candidate" 2>/dev/null | head -n 1)
+            v4_route_line=$(ip -4 route get "$ip_candidate" 2> /dev/null | head -n 1)
             if [ -n "$v4_route_line" ]; then
                 v4_routable="$ip_candidate"
                 v4_route_dev=$(echo "$v4_route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -1833,7 +2940,7 @@ run_traceroute() {
             fi
         done
         for ip_candidate in "${resolved_v6[@]}"; do
-            v6_route_line=$(ip -6 route get "$ip_candidate" 2>/dev/null | head -n 1)
+            v6_route_line=$(ip -6 route get "$ip_candidate" 2> /dev/null | head -n 1)
             if [ -n "$v6_route_line" ]; then
                 v6_routable="$ip_candidate"
                 v6_route_dev=$(echo "$v6_route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -1853,10 +2960,10 @@ run_traceroute() {
             fi
         fi
         if [ -n "$diag_intf" ]; then
-            diag_v4_addr=$(ip -4 addr show dev "$diag_intf" 2>/dev/null | awk '/inet / {print $2; exit}')
-            diag_v6_addr=$(ip -6 addr show dev "$diag_intf" scope global 2>/dev/null | awk '/inet6 / {print $2; exit}')
-            diag_v4_default=$(ip -4 route show default dev "$diag_intf" 2>/dev/null | head -n 1)
-            diag_v6_default=$(ip -6 route show default dev "$diag_intf" 2>/dev/null | head -n 1)
+            diag_v4_addr=$(ip -4 addr show dev "$diag_intf" 2> /dev/null | awk '/inet / {print $2; exit}')
+            diag_v6_addr=$(ip -6 addr show dev "$diag_intf" scope global 2> /dev/null | awk '/inet6 / {print $2; exit}')
+            diag_v4_default=$(ip -4 route show default dev "$diag_intf" 2> /dev/null | head -n 1)
+            diag_v6_default=$(ip -6 route show default dev "$diag_intf" 2> /dev/null | head -n 1)
         fi
         if [ -n "$happy_ip" ]; then
             if [[ "$happy_ip" == *:* ]] && [ -z "$v4_routable" ] && [ -n "$v6_routable" ]; then
@@ -1892,9 +2999,9 @@ run_traceroute() {
         if [ -z "$resolved_target" ]; then
             for ip_candidate in "${resolved_ips[@]}"; do
                 if [[ "$ip_candidate" == *:* ]]; then
-                    route_line=$(ip -6 route get "$ip_candidate" 2>/dev/null | head -n 1)
+                    route_line=$(ip -6 route get "$ip_candidate" 2> /dev/null | head -n 1)
                 else
-                    route_line=$(ip -4 route get "$ip_candidate" 2>/dev/null | head -n 1)
+                    route_line=$(ip -4 route get "$ip_candidate" 2> /dev/null | head -n 1)
                 fi
                 if [ -n "$route_line" ]; then
                     target="$ip_candidate"
@@ -1911,10 +3018,10 @@ run_traceroute() {
 
     if [[ "$target" == *:* ]]; then
         trace_family="-6"
-        route_line=$(ip -6 route get "$target" 2>/dev/null | head -n 1)
+        route_line=$(ip -6 route get "$target" 2> /dev/null | head -n 1)
     else
         trace_family="-4"
-        route_line=$(ip -4 route get "$target" 2>/dev/null | head -n 1)
+        route_line=$(ip -4 route get "$target" 2> /dev/null | head -n 1)
     fi
 
     if [ -n "$route_line" ]; then
@@ -1948,7 +3055,7 @@ run_traceroute() {
     else
         log_err "Could not determine route details for ${target}; using system defaults."
     fi
-    if command -v dublin-traceroute >/dev/null 2>&1; then
+    if command -v dublin-traceroute > /dev/null 2>&1; then
         trace_engine="dublin"
         trace_bin="dublin-traceroute"
     else
@@ -1979,17 +3086,21 @@ run_traceroute() {
         log_ok "Dublin mode: single discovery round only (no ICMP/TCP supplemental probes)."
         log_ok "Dublin options: --broken-nat --delay=${dublin_delay_ms} --npaths=${dublin_npaths} --dport=${dublin_dport}"
     fi
-    if command -v nc >/dev/null 2>&1; then
+    if command -v nc > /dev/null 2>&1; then
         have_nc=1
     fi
     echo "-----------------------------------------------------------------------------------------------"
-    route_hops_raw=$(mktemp)
+    route_hops_file=$(mktemp -t netmgr-route-hops.XXXXXX) || return 1
+    route_hops_raw=$(mktemp) || {
+        rm -f "$route_hops_file"
+        return 1
+    }
     if ! [[ "$discovery_rounds" =~ ^[0-9]+$ ]] || [ "$discovery_rounds" -le 0 ]; then
         discovery_rounds=5
     fi
 
     if [ "$trace_engine" = "dublin" ] && [ "$trace_family" = "-4" ]; then
-        trace_raw=$("${TRACE_CMD[@]}" --broken-nat --delay="${dublin_delay_ms}" --npaths="${dublin_npaths}" --dport="${dublin_dport}" "$target" 2>/dev/null || true)
+        trace_raw=$("${TRACE_CMD[@]}" --broken-nat --delay="${dublin_delay_ms}" --npaths="${dublin_npaths}" --dport="${dublin_dport}" "$target" 2> /dev/null || true)
         echo "[DEBUG] dublin-r1:"
         if [ -n "$trace_raw" ]; then
             printf "%s\n" "$trace_raw"
@@ -2015,9 +3126,9 @@ run_traceroute() {
     elif [ "$trace_family" = "-4" ]; then
         for ((round = 1; round <= discovery_rounds; round++)); do
             if [ "$trace_engine" = "paris" ]; then
-                trace_raw=$("${TRACE_CMD[@]}" -n -p udp "$target" 2>/dev/null || true)
+                trace_raw=$("${TRACE_CMD[@]}" -n -p udp "$target" 2> /dev/null || true)
             else
-                trace_raw=$("${TRACE_CMD[@]}" -4 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+                trace_raw=$("${TRACE_CMD[@]}" -4 -n "${trace_tool_intf_args[@]}" "$target" 2> /dev/null || true)
             fi
             echo "[DEBUG] udp-r${round}:"
             if [ -n "$trace_raw" ]; then
@@ -2038,9 +3149,9 @@ run_traceroute() {
                 }
             ' >> "$route_hops_raw"
             if [ "$trace_engine" = "paris" ]; then
-                trace_raw=$("${TRACE_CMD[@]}" -n -p icmp "$target" 2>/dev/null || true)
+                trace_raw=$("${TRACE_CMD[@]}" -n -p icmp "$target" 2> /dev/null || true)
             else
-                trace_raw=$("${TRACE_CMD[@]}" -4 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+                trace_raw=$("${TRACE_CMD[@]}" -4 -n -I "${trace_tool_intf_args[@]}" "$target" 2> /dev/null || true)
             fi
             echo "[DEBUG] icmp-r${round}:"
             if [ -n "$trace_raw" ]; then
@@ -2061,9 +3172,9 @@ run_traceroute() {
                 }
             ' >> "$route_hops_raw"
             if [ "$trace_engine" = "paris" ]; then
-                trace_raw=$("${TRACE_CMD[@]}" -n -p tcp -d 443 "$target" 2>/dev/null || true)
+                trace_raw=$("${TRACE_CMD[@]}" -n -p tcp -d 443 "$target" 2> /dev/null || true)
             else
-                trace_raw=$("${TRACE_CMD[@]}" -4 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+                trace_raw=$("${TRACE_CMD[@]}" -4 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2> /dev/null || true)
             fi
             echo "[DEBUG] tcp-r${round}:"
             if [ -n "$trace_raw" ]; then
@@ -2086,7 +3197,7 @@ run_traceroute() {
         done
     else
         for ((round = 1; round <= discovery_rounds; round++)); do
-            trace_raw=$("${TRACE_CMD[@]}" -6 -n "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            trace_raw=$("${TRACE_CMD[@]}" -6 -n "${trace_tool_intf_args[@]}" "$target" 2> /dev/null || true)
             echo "[DEBUG] udp-r${round}:"
             if [ -n "$trace_raw" ]; then
                 printf "%s\n" "$trace_raw"
@@ -2106,7 +3217,7 @@ run_traceroute() {
                     }
                 }
             ' >> "$route_hops_raw"
-            trace_raw=$("${TRACE_CMD[@]}" -6 -n -I "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            trace_raw=$("${TRACE_CMD[@]}" -6 -n -I "${trace_tool_intf_args[@]}" "$target" 2> /dev/null || true)
             echo "[DEBUG] icmp-r${round}:"
             if [ -n "$trace_raw" ]; then
                 printf "%s\n" "$trace_raw"
@@ -2126,7 +3237,7 @@ run_traceroute() {
                     }
                 }
             ' >> "$route_hops_raw"
-            trace_raw=$("${TRACE_CMD[@]}" -6 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2>/dev/null || true)
+            trace_raw=$("${TRACE_CMD[@]}" -6 -n -T -p 443 "${trace_tool_intf_args[@]}" "$target" 2> /dev/null || true)
             echo "[DEBUG] tcp-r${round}:"
             if [ -n "$trace_raw" ]; then
                 printf "%s\n" "$trace_raw"
@@ -2341,7 +3452,7 @@ run_traceroute() {
     ' "$route_hops_raw" | sort -n -k1,1n -k2,2n -k3,3n -k4,4 | awk -F'\t' 'BEGIN {OFS="\t"} {if (!($1 in level_map)) level_map[$1] = ++next_level; print level_map[$1], $2, $3, $4}' | sort -n -k1,1n -k2,2n -k3,3n -k4,4 | awk -F'\t' '{print $1 "\t" $4}' > "$route_hops_file"
     fi
 
-    if ! awk -F'\t' -v t="$target" '$2 == t {found=1} END {exit found ? 0 : 1}' "$route_hops_file" 2>/dev/null; then
+    if ! awk -F'\t' -v t="$target" '$2 == t {found=1} END {exit found ? 0 : 1}' "$route_hops_file" 2> /dev/null; then
         max_hop=$(awk -F'\t' 'BEGIN {m=0} $1+0 > m {m=$1+0} END {print m}' "$route_hops_file")
         [ -z "$max_hop" ] && max_hop=0
         printf "%d\t%s\n" "$((max_hop + 1))" "$target" >> "$route_hops_file"
@@ -2349,6 +3460,7 @@ run_traceroute() {
 
     if [ ! -s "$route_hops_file" ]; then
         log_err "No hops discovered."
+        rm -f "$route_hops_file" "$route_hops_raw"
         return 1
     fi
 
@@ -2362,9 +3474,9 @@ run_traceroute() {
 
         samples_file=$(mktemp)
         if [ "$family" = "-4" ]; then
-            ping_out=$(ping -4 -n -c 20 -i 0.2 -W 1 "${ping_iface_args[@]}" "$ip" 2>/dev/null)
+            ping_out=$(ping -4 -n -c 20 -i 0.2 -W 1 "${ping_iface_args[@]}" "$ip" 2> /dev/null)
         else
-            ping_out=$(ping -6 -n -c 20 -i 0.2 -W 1 "${ping_iface_args[@]}" "$ip" 2>/dev/null)
+            ping_out=$(ping -6 -n -c 20 -i 0.2 -W 1 "${ping_iface_args[@]}" "$ip" 2> /dev/null)
         fi
 
         hop_loss=$(echo "$ping_out" | awk -F', ' '/packets transmitted/ {for (i=1; i<=NF; i++) if ($i ~ /% packet loss/) {gsub(/% packet loss/, "", $i); gsub(/[[:space:]]/, "", $i); print $i "%"; exit}}')
@@ -2402,24 +3514,19 @@ run_traceroute() {
         local elapsed_ns=0
         local elapsed_ms=""
         local stats_line=""
+        local -a probe_cmd=(false)
 
         samples_file=$(mktemp)
+        if [ "$have_nc" -eq 1 ]; then
+            probe_cmd=(nc "$family" -z -w 1 "$ip" 443)
+        elif [ "$family" = "-4" ]; then
+            # The child shell, not this shell, expands the positional IP argument.
+            # shellcheck disable=SC2016
+            probe_cmd=(bash -c 'exec 3<>/dev/tcp/"$1"/443' _ "$ip")
+        fi
         for ((i = 1; i <= 20; i++)); do
             start_ns=$(date +%s%N)
-            if [ "$have_nc" -eq 1 ]; then
-                if [ "$family" = "-4" ]; then
-                    timeout 1 nc -4 -z -w 1 "$ip" 443 >/dev/null 2>&1
-                else
-                    timeout 1 nc -6 -z -w 1 "$ip" 443 >/dev/null 2>&1
-                fi
-            else
-                if [ "$family" = "-4" ]; then
-                    timeout 1 bash -c "exec 3<>/dev/tcp/$ip/443" >/dev/null 2>&1
-                else
-                    false
-                fi
-            fi
-            if [ $? -eq 0 ]; then
+            if timeout 1 "${probe_cmd[@]}" > /dev/null 2>&1; then
                 end_ns=$(date +%s%N)
                 elapsed_ns=$((end_ns - start_ns))
                 elapsed_ms=$(awk -v ns="$elapsed_ns" 'BEGIN {printf "%.3f", ns/1000000}')
@@ -2475,16 +3582,17 @@ run_traceroute() {
     ) | column -t | sed 's/_/ /g'
     echo "-----------------------------------------------------------------------------------------------"
     echo ""
-    rm -f "$route_hops_raw"
+    rm -f "$route_hops_file" "$route_hops_raw"
 }
 
 show_help() {
     echo "NETMGR Commands:"
     echo "  interfaces          - List all local network interfaces and their details."
-    echo "  scan [intf] [target] [--ports] [--resolve-hostnames] - Host discovery scan; optional port scan and getent hostname resolution."
-    echo "  ports               - Show active listening ports (TCP/UDP)."
+    echo "  scan [intf] [target] [--once|--duration seconds] [--ports|--services] [--no-resolve-hostnames] - Streaming discovery with background hostname resolution; scan --help lists options."
+    echo "  sockets [--once] [--brief|--verbose|--all-details] - Live, auto-fitting socket table (1s); --once prints a snapshot."
+    echo "  ports               - Compatibility alias for sockets."
     echo "  listen [intf] [managed|monitor] [--channel n] [--bssid mac] [--dedupe] - Listener; managed default, monitor optional."
-    echo "  bssid-scan [intf] [seconds] [--realtime] [--channel n] - Discover BSSID/SSID/channel/signal; --realtime uses monitor mode live RSSI."
+    echo "  bssid-scan [intf] [seconds] [--realtime] [--active|--passive] [--ssid name] [--freq mhz] - Discover BSSID/SSID/channel/signal; realtime defaults to active iw scan."
     echo "  fingerprint <ip> [--fast] - Run aggressive fingerprint scan; --fast scans top 100 ports."
     echo "  traceroute [intf] [target] - Deep traceroute with Edge Node identification."
     echo "  version             - Show netmgr version."
@@ -2498,26 +3606,45 @@ show_version() {
 
 run_command() {
     case "$1" in
-        interfaces) show_interfaces; ;;
-        scan) shift; scan_subnet "$@"; ;;
-        ports) show_ports; ;;
-        listen) shift; listen_subnet "$@"; ;;
-        bssid-scan) shift; bssid_scan "$@"; ;;
-        fingerprint) shift; fingerprint_host "$@"; ;;
-        traceroute) shift; run_traceroute "$@"; ;;
-        version|-v|--version) show_version; ;;
-        help|-h|--help) show_help; ;;
-        exit|quit) exit 0; ;;
+        interfaces) show_interfaces ;;
+        scan)
+            shift
+            scan_subnet "$@"
+            ;;
+        sockets | ports)
+            shift
+            show_ports "$@"
+            ;;
+        listen)
+            shift
+            listen_subnet "$@"
+            ;;
+        bssid-scan)
+            shift
+            bssid_scan "$@"
+            ;;
+        fingerprint)
+            shift
+            fingerprint_host "$@"
+            ;;
+        traceroute)
+            shift
+            run_traceroute "$@"
+            ;;
+        version | -v | --version) show_version ;;
+        help | -h | --help) show_help ;;
+        exit | quit) exit 0 ;;
         "") ;;
-        *) echo "Unknown command: $1"; ;;
+        *) echo "Unknown command: $1" ;;
     esac
 }
 
-if [ $# -gt 0 ]; then
-    run_command "$@"
-else
-    while true; do
-        read -p "NETMGR> " cmd args
-        run_command "$cmd" $args
-    done
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [ $# -gt 0 ]; then
+        run_command "$@"
+    else
+        while read -r -p "NETMGR> " -a command_args; do
+            run_command "${command_args[@]}"
+        done
+    fi
 fi
