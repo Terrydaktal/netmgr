@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import fcntl
+import html
 import ipaddress
 import itertools
 import json
@@ -139,17 +140,124 @@ class Observation:
     port_summary: str = ""
 
 
+def netbios_identity(script):
+    name = ""
+    for key in ("server_name", "workstation_name"):
+        value = clean(script.findtext(f"elem[@key='{key}']", ""))
+        if value and value.lower() not in {"unknown", "<unknown>"}:
+            name = value
+            break
+    output = script.get("output", "")
+    if not name:
+        match = re.search(
+            r"(?:^|[,\n])\s*NetBIOS name:\s*([^,\r\n]+)", output, re.IGNORECASE
+        )
+        if match and (value := clean(match[1])).lower() not in {"unknown", "<unknown>"}:
+            name = value
+    reported_mac = script.findtext("table[@key='mac']/elem[@key='address']", "")
+    if not reported_mac:
+        match = re.search(
+            r"\bNetBIOS MAC:\s*([0-9a-f:]{17})(?=\s|$|,)", output, re.IGNORECASE
+        )
+        reported_mac = match[1] if match else ""
+    reported_mac = mac_address(reported_mac)
+    # This is self-reported identity, never an observed on-link MAC/vendor mapping.
+    hints = (f"NetBIOS-reported MAC: {reported_mac}",) if reported_mac else ()
+    return name, hints
+
+
+def web_identity(port):
+    hints = []
+    endpoint = f"{port.get('portid', '?')}/{port.get('protocol', '?')}"
+    for script in port.findall("script"):
+        output = script.get("output", "")
+        if script.get("id") == "http-title":
+            title = script.findtext("elem[@key='title']")
+            if title is None and not script.findall("*"):
+                title = output.split("\n", 1)[0]
+                if title.lower().startswith(
+                    ("error", "did not follow redirect", "site doesn't have a title")
+                ):
+                    title = ""
+            if title and (title := clean(html.unescape(title))):
+                hints.append(f"HTTP {endpoint} title: {title}")
+        elif script.get("id") == "ssl-cert":
+            common_name = script.findtext(
+                "table[@key='subject']/elem[@key='commonName']", ""
+            )
+            alternatives = []
+            for extension in script.findall("table[@key='extensions']/table"):
+                if (
+                    extension.findtext("elem[@key='name']")
+                    == "X509v3 Subject Alternative Name"
+                ):
+                    alternatives.append(extension.findtext("elem[@key='value']", ""))
+            for line in output.splitlines():
+                if not common_name and line.startswith("Subject:"):
+                    match = re.search(r"(?:Subject:\s*|/)commonName=([^/\r\n]+)", line)
+                    if match:
+                        common_name = match[1]
+                elif not alternatives and line.startswith("Subject Alternative Name:"):
+                    alternatives.append(line.split(":", 1)[1])
+            if common_name and (common_name := clean(common_name)):
+                hints.append(f"TLS {endpoint} CN: {common_name}")
+            for value in ",".join(alternatives).split(",")[:8]:
+                value = clean(value)
+                if value.startswith(("DNS:", "IP Address:")):
+                    hints.append(f"TLS {endpoint} SAN: {value}")
+    return hints
+
+
 def service_identity(host):
     name, rank, hints = "", 0, []
     for port in host.findall("ports/port"):
         state, service = port.find("state"), port.find("service")
-        if state is None or state.get("state") != "open" or service is None:
+        if state is None or state.get("state") != "open":
+            continue
+        hints.extend(web_identity(port))
+        if service is None:
             continue
         if service.get("hostname"):
             name, rank = clean(service.get("hostname")), 2
         for attribute, label in (("ostype", "Service OS"), ("devicetype", "Device")):
             if service.get(attribute):
                 hints.append(f"{label}: {clean(service.get(attribute))}")
+    for script in host.findall("hostscript/script") + host.findall("ports/port/script"):
+        script_id = script.get("id")
+        if script_id == "nbstat":
+            netbios_name, netbios_hints = netbios_identity(script)
+            if netbios_name and rank < 3:
+                name, rank = netbios_name, 2
+            hints.extend(netbios_hints)
+            continue
+        if script_id not in {"smb-os-discovery", "rdp-ntlm-info"}:
+            continue
+        # Prefer structured NSE fields; older versions may only supply output text.
+        fields = {}
+        for line in script.get("output", "").splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                fields[re.sub(r"[^a-z0-9]", "", key.lower())] = clean(value)
+        for item in script.findall("elem"):
+            key = re.sub(r"[^a-z0-9]", "", item.get("key", "").lower())
+            fields[key] = clean(item.text or "")
+        if script_id == "smb-os-discovery":
+            names = ("fqdn", "server", "netbioscomputername", "computername")
+            labels = (
+                ("os", "SMB OS"),
+                ("workgroup", "Workgroup"),
+                ("domain", "Domain"),
+            )
+        else:
+            names = ("dnscomputername", "netbioscomputername")
+            labels = (("productversion", "RDP build"), ("dnsdomainname", "Domain"))
+        for key in names:
+            if fields.get(key) and fields[key].lower() not in {"unknown", "<unknown>"}:
+                name, rank = fields[key], 3
+                break
+        for key, label in labels:
+            if fields.get(key) and fields[key].lower() not in {"unknown", "<unknown>"}:
+                hints.append(f"{label}: {fields[key]}")
     return name, rank, tuple(dict.fromkeys(hints))[:16]
 
 
@@ -1032,6 +1140,35 @@ class Discovery:
         try:
             if self.cancel.is_set():
                 return
+            if self.options.services and address(ip).version == 4:
+                self.publish(ProbeUpdate(ip, generation, status="querying NetBIOS"))
+                try:
+                    # Force only nbstat: its default host rule requires prior port results.
+                    scan(
+                        [
+                            "-sn",
+                            "--script",
+                            "+nbstat",
+                            "--script-timeout",
+                            "4s",
+                            "--host-timeout",
+                            "6s",
+                        ],
+                        "NETBIOS",
+                    )
+                except (
+                    CommandError,
+                    ET.ParseError,
+                    OSError,
+                    subprocess.TimeoutExpired,
+                ) as exc:
+                    if not self.cancel.is_set():
+                        self.warn(
+                            f"{ip}: NetBIOS query incomplete; continuing TCP probes: {exc}"
+                        )
+                if self.cancel.is_set():
+                    return
+                self.publish(ProbeUpdate(ip, generation, status="scanning ports"))
             result = scan(
                 ["-sS", "--top-ports", "200", "--host-timeout", "30s"], "PORTS"
             )
@@ -1052,6 +1189,12 @@ class Discovery:
                         "--version-light",
                         "--host-timeout",
                         "60s",
+                        "--script",
+                        "smb-os-discovery,rdp-ntlm-info,http-title,ssl-cert",
+                        "--script-timeout",
+                        "8s",
+                        "--script-args",
+                        "http.max-body-size=65536,http.truncated-ok=true",
                     ],
                     "SERVICES",
                 )
