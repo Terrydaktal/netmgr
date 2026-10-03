@@ -810,7 +810,7 @@ socket_snapshot() {
 }
 
 sockets_use_tui() {
-    return 1
+    [[ -t 0 && -t 1 && "${TERM:-dumb}" != dumb ]]
 }
 
 show_sockets_live() {
