@@ -426,9 +426,501 @@ scan_subnet() {
     python3 "${script_path%/*}/lib/discovery.py" "$@"
 }
 
+format_port_table() {
+    local header=""
+    local color_enabled=0
+    local terminal_columns=268
+    local terminal_size=""
+
+    if [[ "${COLUMNS:-}" =~ ^[1-9][0-9]*$ ]]; then
+        terminal_columns=$COLUMNS
+    elif [ -t 1 ]; then
+        terminal_size=$(stty size 2> /dev/null) || true
+        if [[ "$terminal_size" =~ ^[0-9]+[[:space:]]+([1-9][0-9]*)$ ]]; then
+            terminal_columns=${BASH_REMATCH[1]}
+        fi
+    fi
+    if [ "$terminal_columns" -gt 268 ]; then
+        terminal_columns=268
+    fi
+
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        color_enabled=1
+    fi
+
+    awk -v color_enabled="$color_enabled" -v full_details="${4:-0}" -v verbose="${5:-0}" -v machine="${6:-0}" -v terminal_columns="$terminal_columns" '
+        BEGIN {
+            columns = split("State\tNetid\tOrigin\tLocal Address:Port\tPeer Address:Port\tDownloaded\tUploaded\tRecv-Q\tSend-Q\tPID\tExecutable", labels, "\t")
+            gap = full_details ? "  " : " "
+            clip_columns = !full_details && !verbose && !machine
+            if (machine) color_enabled = 0
+            if (!full_details) {
+                labels[2] = "Net"
+                labels[4] = "Local"
+                labels[5] = "Peer"
+                labels[8] = "Recv"
+                labels[9] = "Send"
+                labels[11] = "App"
+            }
+            max_width["App"] = 112; min_width["App"] = 16
+            max_width["CWD"] = 64; min_width["CWD"] = 12
+            max_width["Command"] = 48; min_width["Command"] = 16
+            for (col = 1; col <= columns; col++) widths[col] = length(labels[col])
+            executable_col = 11
+            origin_order["-"] = 0
+            origin_order["OUTBOUND*"] = 1
+            origin_order["SAME-HOST*"] = 2
+            origin_order["INBOUND*"] = 3
+            origin_order["UNKNOWN"] = 4
+        }
+        function byte_text(value,    scaled, unit, units) {
+            if (value !~ /^[0-9]+$/) return value
+            if (value + 0 < 1024) return value "B"
+            split("B KiB MiB GiB TiB PiB EiB", units, " ")
+            scaled = value + 0
+            unit = 1
+            while (scaled >= 1024 && unit < 7) { scaled /= 1024; unit++ }
+            if (scaled >= 1023.95 && unit < 7) { scaled /= 1024; unit++ }
+            return sprintf("%.1f%s", scaled, units[unit])
+        }
+        function cell_text(row, col) {
+            return !machine && !full_details && (col == 6 || col == 7) ? byte_text(cells[row, col]) : cells[row, col]
+        }
+        function valid_counter(value) {
+            return value ~ /^[0-9]+$/ && (length(value) < 20 ||
+                (length(value) == 20 && "x" value <= "x18446744073709551615"))
+        }
+        function traffic_totals(row, text,    fields, n, i, field, counters, seen, supported) {
+            cells[row, 6] = cells[row, 7] = "-"
+            if (protocols[row] != "tcp" || states[row] ~ /^(LISTEN|TIME-WAIT)$/) return
+            # Process names are quoted and may contain strings resembling TCP counters.
+            gsub(/"([^"\\]|\\.)*"/, "", text)
+            n = split(text, fields, /[[:space:]]+/)
+            for (i = 7; i <= n; i++) {
+                split(fields[i], field, ":")
+                if (field[1] !~ /^bytes_(received|acked)$/) continue
+                if (++seen[field[1]] == 1 && fields[i] == field[1] ":" field[2] && valid_counter(field[2])) {
+                    counters[field[1]] = field[2]
+                    supported = 1
+                } else counters[field[1]] = "-"
+            }
+            # ss suppresses zeros. A reported member proves this paired set is supported;
+            # without either counter, retain unknown rather than inventing zero traffic.
+            if (supported) {
+                cells[row, 6] = "bytes_received" in counters ? counters["bytes_received"] : "0"
+                cells[row, 7] = "bytes_acked" in counters ? counters["bytes_acked"] : "0"
+            }
+        }
+        function render_row(row,    col, position, value, line) {
+            line = ""
+            for (position = 1; position <= visible_count; position++) {
+                col = visible_columns[position]
+                value = row == 0 ? labels[col] : cell_text(row, col)
+                if (machine) {
+                    gsub(/[\t\r\n\033]/, " ", value)
+                    line = line (col == 1 ? "" : "\t") value
+                    continue
+                }
+                if (clip_columns && labels[col] in max_width && length(value) > widths[col]) {
+                    value = labels[col] == "CWD" ? "..." substr(value, length(value) - widths[col] + 4) : substr(value, 1, widths[col] - 3) "..."
+                }
+                line = line (position == 1 ? "" : gap) (position == visible_count ? value : sprintf(col >= 6 && col <= 9 ? "%*s" : "%-*s", widths[col], value))
+            }
+            return line
+        }
+        function normalize_ip(value,    octets, halves, left, right, n, nl, nr, i, part, result, tail) {
+            gsub(/^\[|\]$/, "", value)
+            sub(/%.*/, "", value)
+            value = tolower(value)
+            if (value ~ /\./) {
+                tail = value
+                sub(/^.*:/, "", tail)
+                if (split(tail, octets, ".") != 4) return ""
+                for (i = 1; i <= 4; i++) {
+                    if (octets[i] !~ /^[0-9]+$/ || octets[i] > 255) return ""
+                }
+                tail = sprintf("%x:%x", octets[1] * 256 + octets[2], octets[3] * 256 + octets[4])
+                if (value !~ /:/) value = "::ffff:" tail
+                else sub(/[^:]+$/, tail, value)
+            }
+            if (value !~ /:/ || value ~ /[^0-9a-f:]/) return ""
+            n = split(value, halves, "::")
+            if (n > 2) return ""
+            nl = halves[1] == "" ? 0 : split(halves[1], left, ":")
+            nr = n == 2 && halves[2] != "" ? split(halves[2], right, ":") : 0
+            if ((n == 1 && nl != 8) || (n == 2 && nl + nr >= 8)) return ""
+            result = ""
+            for (i = 1; i <= 8; i++) {
+                part = i <= nl ? left[i] : (i > 8 - nr ? right[i - (8 - nr)] : "0")
+                if (part !~ /^[0-9a-f]+$/ || length(part) > 4) return ""
+                sub(/^0+/, "", part)
+                if (part == "") part = "0"
+                result = result (i == 1 ? "" : ":") part
+            }
+            return result
+        }
+        function endpoint_ip(endpoint) {
+            sub(/:[^:]*$/, "", endpoint)
+            return normalize_ip(endpoint)
+        }
+        function endpoint_port(endpoint) {
+            sub(/^.*:/, "", endpoint)
+            return endpoint
+        }
+        function socket_key(proto, src, sport, dst, dport) {
+            return proto SUBSEP src SUBSEP sport SUBSEP dst SUBSEP dport
+        }
+        function remember(proto, src, sport, dst, dport, origin,    key) {
+            key = socket_key(proto, src, sport, dst, dport)
+            if (key in records) {
+                if (records[key] != NR || origins[key] != origin) origins[key] = "UNKNOWN"
+            } else {
+                records[key] = NR
+                origins[key] = origin
+            }
+        }
+        function is_loopback(ip) {
+            return ip == "0:0:0:0:0:0:0:1" || ip ~ /^0:0:0:0:0:ffff:7f[0-9a-f][0-9a-f]:/
+        }
+        function is_wildcard(ip, endpoint) {
+            return ip == "0:0:0:0:0:0:0:0" ||
+                ip == "0:0:0:0:0:ffff:0:0" || endpoint ~ /^\*:/
+        }
+        function print_row(row,    rendered) {
+            rendered = render_row(row)
+            if (color_enabled && wildcard_listener[row]) {
+                printf "\033[1;33m%s\033[0m\n", rendered
+            } else if (color_enabled && cells[row, 3] == "INBOUND*") {
+                printf "\033[1;36m%s\033[0m\n", rendered
+            } else {
+                print rendered
+            }
+        }
+        reading_details {
+            n = split($0, detail_fields, "\t")
+            if (FNR == 1) {
+                if (detail_fields[1] != "Row" || detail_fields[2] != "PID") next
+                columns = 8 + n
+                for (i = 2; i <= n; i++) {
+                    labels[8 + i] = detail_fields[i]
+                    if (detail_fields[i] == "Executable" || detail_fields[i] == "App") executable_col = 8 + i
+                }
+                for (col = 1; col <= columns; col++) widths[col] = length(labels[col])
+                detail_header = 1
+                next
+            }
+            if (!detail_header || detail_fields[1] !~ /^[1-9][0-9]*$/ || n != columns - 8) next
+            row = detail_fields[1] + 0
+            for (i = 2; i <= n; i++) cells[row, 8 + i] = detail_fields[i]
+            has_details[row] = 1
+            next
+        }
+        reading_conntrack {
+            proto = ""
+            for (i = 1; i <= NF && i <= 3; i++) {
+                if ($i == "tcp" || $i == "udp") proto = $i
+            }
+            if (proto == "") next
+            delete tuple
+            t = 0
+            uncertain = 0
+            for (i = 1; i <= NF; i++) {
+                split($i, field, "=")
+                if (field[1] == "src") t++
+                if (field[1] ~ /^(src|dst|sport|dport)$/) tuple[t, field[1]] = field[2]
+                # ss does not expose conntrack zones, so do not guess across them.
+                if (field[1] ~ /^zone(-orig|-reply)?$/ && field[2] != "0") uncertain = 1
+            }
+            if (t != 2) next
+            valid = 1
+            for (t = 1; t <= 2; t++) {
+                tuple[t, "src"] = normalize_ip(tuple[t, "src"])
+                tuple[t, "dst"] = normalize_ip(tuple[t, "dst"])
+                if (tuple[t, "src"] == "" || tuple[t, "dst"] == "" ||
+                    tuple[t, "sport"] !~ /^[0-9]+$/ || tuple[t, "sport"] > 65535 ||
+                    tuple[t, "dport"] !~ /^[0-9]+$/ || tuple[t, "dport"] > 65535) valid = 0
+            }
+            if (!valid) next
+            if (proto == "tcp" && / ESTABLISHED / && /\[UNREPLIED\]/) uncertain = 1
+            outgoing = uncertain ? "UNKNOWN" : "OUTBOUND*"
+            incoming = uncertain ? "UNKNOWN" : "INBOUND*"
+            # Original and reversed reply tuples cover both sides of NAT.
+            remember(proto, tuple[1, "src"], tuple[1, "sport"], tuple[1, "dst"], tuple[1, "dport"], outgoing)
+            remember(proto, tuple[2, "dst"], tuple[2, "dport"], tuple[2, "src"], tuple[2, "sport"], outgoing)
+            remember(proto, tuple[2, "src"], tuple[2, "sport"], tuple[2, "dst"], tuple[2, "dport"], incoming)
+            remember(proto, tuple[1, "dst"], tuple[1, "dport"], tuple[1, "src"], tuple[1, "sport"], incoming)
+            next
+        }
+        FNR == 1 { header = $0; next }
+        NF >= 6 && ($1 == "tcp" || $1 == "udp") {
+            count++
+            cells[count, 1] = $2
+            cells[count, 2] = $1
+            cells[count, 4] = $5
+            cells[count, 5] = $6
+            cells[count, 8] = $3
+            cells[count, 9] = $4
+            if (!(count in has_details)) {
+                for (col = 10; col <= columns; col++) cells[count, col] = "-"
+                tail = $0
+                pids = names = ""
+                delete seen_pid
+                while (match(tail, /\("(([^"\\]|\\.)*)",pid=([0-9]+),fd=[0-9]+\)/, owner)) {
+                    if (!(owner[3] in seen_pid)) {
+                        pids = pids (pids == "" ? "" : ";") owner[3]
+                        names = names (names == "" ? "" : " | ") owner[1]
+                        seen_pid[owner[3]] = 1
+                    }
+                    tail = substr(tail, RSTART + RLENGTH)
+                }
+                if (pids != "") {
+                    cells[count, 10] = pids
+                    cells[count, executable_col] = names
+                }
+            }
+            protocols[count] = $1
+            states[count] = $2
+            traffic_totals(count, $0)
+            addresses[count] = $5
+            sub(/:[^:]*$/, "", addresses[count])
+            local_ip[count] = endpoint_ip($5)
+            local_port[count] = endpoint_port($5)
+            # Keep the kernel state for grouping; only rename bound UDP sockets for display.
+            if ($1 == "udp" && $2 == "UNCONN" && local_port[count] ~ /^[0-9]+$/ && local_port[count] + 0 > 0) {
+                cells[count, 1] = "BOUND"
+            }
+            wildcard_listener[count] = $2 == "LISTEN" && is_wildcard(local_ip[count], $5)
+            peer_ip[count] = endpoint_ip($6)
+            peer_port[count] = endpoint_port($6)
+            # A scoped link-local tuple cannot be uniquely matched without its interface.
+            scoped[count] = ($5 ~ /%/ || $6 ~ /%/) &&
+                (local_ip[count] ~ /^fe[89ab]/ || peer_ip[count] ~ /^fe[89ab]/)
+            if (local_ip[count] != "" && local_ip[count] != "0:0:0:0:0:0:0:0" &&
+                local_ip[count] != "0:0:0:0:0:ffff:0:0") local_addresses[local_ip[count]] = 1
+        }
+        END {
+            if (header == "") exit
+            for (row = 1; row <= count; row++) {
+                origin = "UNKNOWN"
+                key = socket_key(protocols[row], local_ip[row], local_port[row], peer_ip[row], peer_port[row])
+                if (states[row] == "LISTEN" || peer_port[row] == "*") origin = "-"
+                else if (!scoped[row] && key in origins) {
+                    origin = origins[key]
+                    if (origin != "UNKNOWN" && (peer_ip[row] in local_addresses || is_loopback(peer_ip[row]))) {
+                        origin = "SAME-HOST*"
+                    }
+                }
+                cells[row, 3] = origin
+                for (col = 1; col <= columns; col++) {
+                    if (length(cell_text(row, col)) > widths[col]) widths[col] = length(cell_text(row, col))
+                }
+            }
+            age_col = 0
+            for (col = 1; col <= columns; col++) {
+                if (labels[col] == "Age") age_col = col
+            }
+            for (col = 1; col <= columns; col++) {
+                if (!machine) {
+                    if (col == 8 && age_col) visible_columns[++visible_count] = age_col
+                    if (col == age_col || (!verbose && !full_details && (col == 8 || col == 9))) continue
+                }
+                visible_columns[++visible_count] = col
+            }
+            if (clip_columns) {
+                if (columns == 11) { max_width["App"] = 16; min_width["App"] = 8 }
+                total_width = visible_count - 1
+                for (position = 1; position <= visible_count; position++) {
+                    col = visible_columns[position]
+                    if (labels[col] in max_width && widths[col] > max_width[labels[col]]) widths[col] = max_width[labels[col]]
+                    total_width += widths[col]
+                }
+                while (total_width > terminal_columns) {
+                    widest = spare = 0
+                    for (col = 1; col <= columns; col++) {
+                        if (!(labels[col] in min_width)) continue
+                        available = widths[col] - min_width[labels[col]]
+                        if (available > spare) {
+                            widest = col
+                            spare = available
+                        }
+                    }
+                    if (!widest) break
+                    widths[widest]--
+                    total_width--
+                }
+            }
+            print render_row(0)
+            for (row = 1; row <= count; row++) {
+                printf "%s\t%d\t%s\t%s\t%s\t", states[row], origin_order[cells[row, 3]], protocols[row], addresses[row], local_port[row]
+                print_row(row)
+            }
+        }
+    ' reading_details=1 "${3:-/dev/null}" reading_details=0 reading_conntrack=1 "$1" reading_conntrack=0 "$2" | {
+        IFS= read -r header || return 0
+        printf '%s\n' "$header"
+        LC_ALL=C sort -t $'\t' -k1,1 -k2,2n -k3,3 -k4,4V -k5,5n | cut -f6-
+    }
+}
+
+collect_port_details() {
+    local script_path=""
+    if ! command -v python3 > /dev/null 2>&1; then
+        printf '%s\n' 'Warning: python3 is required for process details; showing the socket table only.' >&2
+        return 0
+    fi
+    script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || return 1
+    python3 -I "${script_path%/*}/lib/ports.py" "$@"
+}
+
+socket_snapshot() {
+    local sockets=""
+    local conntrack=""
+    local brief="${1:-0}" all_details="${2:-0}" verbose="${3:-0}" machine="${4:-0}"
+    local details_rc=0
+    local details=""
+    local -a detail_args=()
+
+    if [ "$all_details" -eq 1 ]; then
+        detail_args=(--all-details)
+    elif [ "$verbose" -eq 1 ]; then
+        detail_args=(--verbose)
+    fi
+    sockets=$(LC_ALL=C sudo -n ss -tuanp -i -O) || return $?
+    if ! conntrack=$(sudo -n cat /proc/net/nf_conntrack 2> /dev/null); then
+        conntrack=""
+        printf '%s\n' 'Warning: conntrack snapshot unavailable; connection origins will be UNKNOWN.' >&2
+    fi
+
+    if [ "$brief" -eq 0 ]; then
+        details=$(printf '%s\n' "$sockets" | collect_port_details "${detail_args[@]}") || details_rc=$?
+        if [ "$details_rc" -eq 130 ]; then
+            return 130
+        elif [ "$details_rc" -ne 0 ]; then
+            details=""
+            printf '%s\n' 'Warning: process detail collection failed; showing the basic socket columns.' >&2
+        fi
+    fi
+    format_port_table <(printf '%s\n' "$conntrack") <(printf '%s\n' "$sockets") <(printf '%s\n' "$details") "$all_details" "$verbose" "$machine" || return $?
+    [ "$machine" -eq 1 ] && return 0
+    printf '\n%s\n' 'Origin: OUTBOUND*/INBOUND* = inferred local/remote initiation; SAME-HOST* = both endpoints on this machine.'
+    printf '%s\n' '* Initiation is inferred, not verified: TCP can be picked up midstream; UDP records first-observed traffic.'
+    printf '%s\n' 'UNKNOWN = no unique usable match; - = listener or socket without a connected peer. Snapshot only; no new monitoring.'
+    printf '%s\n' 'BOUND = UDP socket with a local port and no fixed peer; not a TCP listening state.'
+    printf '%s\n' 'Downloaded/Uploaded = TCP bytes received/acknowledged over the connection lifetime; - = unavailable. Recv/Send are queues, not totals.'
+}
+
+sockets_use_tui() {
+    return 1
+}
+
+show_sockets_live() {
+    local script_path=""
+    if ! command -v python3 > /dev/null 2>&1; then
+        printf '%s\n' 'Error: python3 with curses is required for the live view; use sockets --once.' >&2
+        return 1
+    fi
+    script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || return 1
+    python3 -I "${script_path%/*}/lib/sockets_tui.py" "$@"
+}
+
 show_ports() {
+    local brief=0 verbose=0 all_details=0 once=0
+    local -a live_args=()
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --brief) brief=1 ;;
+            --verbose | -v) verbose=1 ;;
+            --all-details) all_details=1 ;;
+            --once) once=1 ;;
+            --help | -h)
+                cat << 'EOF'
+NAME
+  netmgr sockets - live, read-only TCP/UDP socket table (alias: ports)
+SYNOPSIS
+  netmgr sockets [--once] [--brief | --verbose | --all-details]
+DESCRIPTION
+  Socket state, inferred origin, endpoints and process identity. App shows
+  current process ancestry; CWD is the working directory. For live sockets,
+  Age is process uptime. For CLOSED/GONE* rows, Age is time since closure was
+  observed; Process age retains the last known process uptime.
+  Downloaded/Uploaded are TCP lifetime bytes received/acknowledged, not queues.
+OPTIONS
+  --once          Print one snapshot instead of opening the live view.
+  --brief         Omit metadata; show PID and the short executable name.
+  --verbose, -v   Add Recv/Send queues and Command (abbreviated command paths).
+  --all-details   Include all metadata columns and complete commands.
+  --help, -h      Show this help. Alias: netmgr ports (same options).
+OPERATION
+  Interactive terminals refresh every second. Columns fit and grow with the
+  terminal; live rows never wrap. Slow collection keeps the previous snapshot
+  visible with its age; only one collection runs at a time.
+  Arrows/PgUp/PgDn/Home/End scroll; / or F3 opens an all-column search.
+  Mouse wheel scrolls five rows per notch; arrow keys move one row.
+  Click a header: descending first, ascending next; each click reverses it.
+  Click State to restore State > Origin > Net > Local > Port (startup order).
+  F6 also chooses a sort column (including hidden columns).
+  Age, Downloaded and Uploaded sort globally, then State and Origin for ties.
+  Other columns stay within State and Origin groups; missing values stay last.
+  Traffic totals use binary units; Enter shows exact bytes, --all-details does too.
+  UDP, listeners and missing TCP counters show -, not a fabricated zero.
+  Live mode follows ss -E destruction events. CLOSED rows were confirmed by
+  an event; GONE* rows disappeared between successful snapshots. Both remain
+  visible for 60 seconds with Age and their last available details.
+  --once shows the current socket snapshot without recent history.
+  Click again or press r to reverse it; ^/v shows ascending/descending.
+  In F6, Enter applies, Esc cancels, and Default restores the original ordering.
+  Type to filter live (case-insensitive, including hidden/full column values).
+  Enter applies; Esc cancels/clears; Ctrl+U clears the search input.
+  Space pauses; Enter shows a row; ? shows help; q or Ctrl+C exits.
+  Resize is automatic. Inbound rows are cyan; wildcard listeners are yellow.
+  Recent rows are dimmed. Age follows Uploaded, before PID. GONE* Age
+  starts at the first absent snapshot, not the unknown exact disconnect time.
+  Redirected output, non-interactive input and TERM=dumb use one snapshot.
+  --once --verbose/--all-details retain unabridged columns and may wrap.
+EXAMPLES
+  netmgr sockets
+  netmgr sockets --verbose
+  netmgr sockets --once > sockets.txt
+FILES
+  /proc/net/nf_conntrack; /proc/PID; local systemd/container metadata.
+PATHS
+  lib/ports.py collects metadata; lib/sockets_tui.py renders the live view.
+SECURITY NOTES
+  Authenticates once using sudo; refreshes never prompt inside the UI.
+  ss -E reads kernel destruction events; it does not capture packets. No new
+  conntrack rules, socket killing or network probes are used.
+  Origins are inferred, not verified. UNKNOWN means no usable unique match.
+  Commands may contain secrets. Some columns hide on narrow terminals;
+  Enter opens the selected row, including hidden and clipped fields.
+EXIT STATUS
+  0 normal exit; 1 setup failure; 2 invalid options; 130 interrupted.
+  Snapshot command failures preserve their command exit status.
+AUTHORS
+  netmgr contributors.
+EOF
+                return 0
+                ;;
+            *)
+                printf 'Error: unknown sockets option: %s\n' "$1" >&2
+                return 2
+                ;;
+        esac
+        shift
+    done
+    if [ "$brief" -eq 1 ] && { [ "$all_details" -eq 1 ] || [ "$verbose" -eq 1 ]; }; then
+        printf '%s\n' 'Error: --brief cannot be combined with --verbose or --all-details.' >&2
+        return 2
+    fi
     ensure_sudo_session || return 1
-    sudo ss -tuanp | sort -k 1,1
+    if [ "$once" -eq 0 ] && sockets_use_tui; then
+        [ "$brief" -eq 1 ] && live_args+=(--brief)
+        [ "$verbose" -eq 1 ] && live_args+=(--verbose)
+        [ "$all_details" -eq 1 ] && live_args+=(--all-details)
+        show_sockets_live "${live_args[@]}"
+        return $?
+    fi
+    socket_snapshot "$brief" "$all_details" "$verbose"
 }
 
 bssid_scan_realtime() {
